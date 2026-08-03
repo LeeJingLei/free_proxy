@@ -126,7 +126,7 @@ static void relay(int client_fd, int upstream_fd) {
     };
     unsigned char buffer[16384];
 
-    for (;;) {
+    while (keep_running) {
         int poll_result = poll(descriptors, 2, FP_IDLE_TIMEOUT_MS);
 
         if (poll_result <= 0) {
@@ -203,6 +203,7 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
     };
 
     struct sigaction child_action = {.sa_handler = reap_clients};
+    sigset_t child_signal_mask;
 
     keep_running = 1;
     active_clients = 0;
@@ -211,6 +212,8 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
     sigemptyset(&child_action.sa_mask);
     child_action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     (void)sigaction(SIGCHLD, &child_action, NULL);
+    sigemptyset(&child_signal_mask);
+    sigaddset(&child_signal_mask, SIGCHLD);
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0 || setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) != 0 ||
         bind(listener, (struct sockaddr *)&listen_address, sizeof(listen_address)) != 0 ||
@@ -233,6 +236,7 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
         int poll_result = poll(&listener_poll, 1, 500);
         int client_fd;
         pid_t child;
+        sigset_t previous_signal_mask;
 
         if (poll_result == 0) {
             continue;
@@ -258,11 +262,19 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
             close(client_fd);
             continue;
         }
+        if (sigprocmask(SIG_BLOCK, &child_signal_mask, &previous_signal_mask) != 0) {
+            close(client_fd);
+            continue;
+        }
         child = fork();
         if (child == 0) {
+            pid_t parent_pid = getppid();
             close(listener);
-            (void)prctl(PR_SET_PDEATHSIG, SIGTERM);
-            if (drop_client_privileges() != 0) {
+            (void)signal(SIGTERM, SIG_DFL);
+            (void)signal(SIGINT, SIG_DFL);
+            (void)sigprocmask(SIG_SETMASK, &previous_signal_mask, NULL);
+            if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent_pid ||
+                drop_client_privileges() != 0) {
                 close(client_fd);
                 _exit(1);
             }
@@ -272,6 +284,7 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
         if (child > 0) {
             ++active_clients;
         }
+        (void)sigprocmask(SIG_SETMASK, &previous_signal_mask, NULL);
         close(client_fd);
     }
     close(listener);

@@ -1,8 +1,6 @@
 #include "free_proxy.h"
 
 #include <arpa/inet.h>
-#include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -149,6 +147,24 @@ static int is_legacy_daemon(pid_t pid) {
     }
     return strcmp(command + first_argument_length + 1, "run") == 0;
 }
+static int read_legacy_pid(pid_t *pid) {
+    FILE *file;
+    long parsed_pid;
+    char extra[2];
+    int matched;
+
+    file = fopen(FP_PID_PATH, "r");
+    if (file == NULL) {
+        return -1;
+    }
+    matched = fscanf(file, "%ld %1s", &parsed_pid, extra);
+    fclose(file);
+    if (matched != 1 || parsed_pid <= 1) {
+        return -1;
+    }
+    *pid = (pid_t)parsed_pid;
+    return 0;
+}
 
 static int stop_process(pid_t pid, unsigned long long start_time) {
     struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000L};
@@ -184,35 +200,15 @@ static int stop_process(pid_t pid, unsigned long long start_time) {
     return -1;
 }
 
-static int stop_legacy_daemons(void) {
-    DIR *directory = opendir("/proc");
-    struct dirent *entry;
+static int stop_legacy_daemon_from_pid_file(void) {
+    pid_t pid;
+    unsigned long long start_time;
 
-    if (directory == NULL) {
-        return -1;
+    if (read_legacy_pid(&pid) != 0 || !is_legacy_daemon(pid) ||
+        process_start_time(pid, &start_time) != 0) {
+        return 0;
     }
-    while ((entry = readdir(directory)) != NULL) {
-        char *end = NULL;
-        long value;
-        unsigned long long start_time;
-
-        if (!isdigit((unsigned char)entry->d_name[0])) {
-            continue;
-        }
-        errno = 0;
-        value = strtol(entry->d_name, &end, 10);
-        if (errno != 0 || *end != '\0' || value <= 1) {
-            continue;
-        }
-        if (is_legacy_daemon((pid_t)value) &&
-            process_start_time((pid_t)value, &start_time) == 0 &&
-            stop_process((pid_t)value, start_time) != 0) {
-            closedir(directory);
-            return -1;
-        }
-    }
-    closedir(directory);
-    return 0;
+    return stop_process(pid, start_time);
 }
 
 pid_t fp_read_pid(void) {
@@ -257,7 +253,7 @@ int fp_lock_acquire(void) {
     if (ensure_runtime_dir() != 0) {
         return -1;
     }
-    file_descriptor = open(FP_LOCK_PATH, O_RDWR | O_CREAT, 0600);
+    file_descriptor = open(FP_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (file_descriptor < 0 || flock(file_descriptor, LOCK_EX) != 0) {
         if (file_descriptor >= 0) {
             close(file_descriptor);
@@ -304,7 +300,7 @@ int fp_start_daemon(const struct fp_config *config) {
         }
         return -1;
     }
-    if (stop_legacy_daemons() != 0) {
+    if (stop_legacy_daemon_from_pid_file() != 0) {
         return -1;
     }
     fp_remove_pid();
@@ -353,7 +349,7 @@ int fp_stop_daemon(void) {
     unsigned long long start_time;
     struct fp_config config;
     if (read_process_record(&pid, &start_time, &config) != 0) {
-        if (stop_legacy_daemons() != 0) {
+        if (stop_legacy_daemon_from_pid_file() != 0) {
             return -1;
         }
         fp_remove_pid();
