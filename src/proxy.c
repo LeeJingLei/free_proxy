@@ -2,21 +2,49 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <grp.h>
 #include <linux/netfilter_ipv4.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t keep_running = 1;
+static volatile sig_atomic_t active_clients = 0;
 
 static void stop_proxy(int signal_number) {
     (void)signal_number;
     keep_running = 0;
+}
+
+static void reap_clients(int signal_number) {
+    int saved_errno = errno;
+
+    (void)signal_number;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+        if (active_clients > 0) {
+            --active_clients;
+        }
+    }
+    errno = saved_errno;
+}
+
+static int set_socket_timeouts(int file_descriptor, int timeout_ms) {
+    struct timeval timeout = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
+    };
+
+    return setsockopt(file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+                   setsockopt(file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0
+               ? 0
+               : -1;
 }
 
 static int write_all(int file_descriptor, const void *buffer, size_t length) {
@@ -65,7 +93,9 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
     };
 
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd < 0 || connect(socket_fd, (struct sockaddr *)&proxy, sizeof(proxy)) != 0 ||
+    if (socket_fd < 0 || set_socket_timeouts(socket_fd, FP_CONNECT_TIMEOUT_MS) != 0 ||
+        connect(socket_fd, (struct sockaddr *)&proxy, sizeof(proxy)) != 0 ||
+        set_socket_timeouts(socket_fd, FP_IO_TIMEOUT_MS) != 0 ||
         write_all(socket_fd, greeting, sizeof(greeting)) != 0 ||
         read_all(socket_fd, response, sizeof(response)) != 0 || response[0] != 0x05 ||
         response[1] != 0x00) {
@@ -82,26 +112,9 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
         close(socket_fd);
         return -1;
     }
-    if (response[0] == 0x05) {
-        unsigned char discard[256];
-        size_t address_length;
-
-        if (read_all(socket_fd, response, 2) != 0) {
-            close(socket_fd);
-            return -1;
-        }
-        address_length = response[1] == 0x01 ? 4 : response[1] == 0x04 ? 16 : 0;
-        if (response[1] == 0x03) {
-            if (read_all(socket_fd, response, 1) != 0) {
-                close(socket_fd);
-                return -1;
-            }
-            address_length = response[0];
-        }
-        if (address_length == 0 || read_all(socket_fd, discard, address_length + 2) != 0) {
-            close(socket_fd);
-            return -1;
-        }
+    if (fp_socks5_drain_bind(socket_fd) != 0) {
+        close(socket_fd);
+        return -1;
     }
     return socket_fd;
 }
@@ -113,7 +126,15 @@ static void relay(int client_fd, int upstream_fd) {
     };
     unsigned char buffer[16384];
 
-    while (poll(descriptors, 2, -1) > 0) {
+    for (;;) {
+        int poll_result = poll(descriptors, 2, FP_IDLE_TIMEOUT_MS);
+
+        if (poll_result <= 0) {
+            if (poll_result < 0 && errno == EINTR) {
+                continue;
+            }
+            return;
+        }
         for (size_t index = 0; index < 2; ++index) {
             int source = descriptors[index].fd;
             int target = descriptors[1 - index].fd;
@@ -138,12 +159,20 @@ static void relay(int client_fd, int upstream_fd) {
     }
 }
 
+static int drop_client_privileges(void) {
+    if (geteuid() != 0) {
+        return 0;
+    }
+    return setgroups(0, NULL) == 0 && setgid(65534) == 0 && setuid(65534) == 0 ? 0 : -1;
+}
+
 static void handle_client(int client_fd, const struct fp_config *config) {
     struct sockaddr_in destination;
     socklen_t destination_length = sizeof(destination);
     int upstream_fd;
 
-    if (getsockopt(client_fd, SOL_IP, SO_ORIGINAL_DST, &destination, &destination_length) != 0) {
+    if (set_socket_timeouts(client_fd, FP_IO_TIMEOUT_MS) != 0 ||
+        getsockopt(client_fd, SOL_IP, SO_ORIGINAL_DST, &destination, &destination_length) != 0) {
         close(client_fd);
         return;
     }
@@ -155,7 +184,16 @@ static void handle_client(int client_fd, const struct fp_config *config) {
     close(client_fd);
 }
 
-int fp_proxy_run(const struct fp_config *config) {
+static void signal_ready(int ready_fd, char value) {
+    if (ready_fd >= 0) {
+        if (write(ready_fd, &value, 1) < 0) {
+            /* Parent will treat a missing readiness signal as startup failure. */
+        }
+        (void)close(ready_fd);
+    }
+}
+
+int fp_proxy_run(const struct fp_config *config, int ready_fd) {
     int listener;
     int option = 1;
     struct sockaddr_in listen_address = {
@@ -164,39 +202,75 @@ int fp_proxy_run(const struct fp_config *config) {
         .sin_port = htons(FP_LISTEN_PORT),
     };
 
+    struct sigaction child_action = {.sa_handler = reap_clients};
+
+    keep_running = 1;
+    active_clients = 0;
     signal(SIGTERM, stop_proxy);
     signal(SIGINT, stop_proxy);
-    signal(SIGCHLD, SIG_IGN);
+    sigemptyset(&child_action.sa_mask);
+    child_action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    (void)sigaction(SIGCHLD, &child_action, NULL);
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0 || setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) != 0 ||
         bind(listener, (struct sockaddr *)&listen_address, sizeof(listen_address)) != 0 ||
         listen(listener, 128) != 0) {
-        perror("start transparent proxy");
         if (listener >= 0) {
             close(listener);
         }
+        signal_ready(ready_fd, 'E');
         return -1;
     }
-    if (fp_write_pid() != 0) {
+    if (fp_write_pid(config) != 0 || fp_firewall_enable(config) != 0) {
         close(listener);
+        (void)fp_firewall_disable();
+        signal_ready(ready_fd, 'E');
         return -1;
     }
+    signal_ready(ready_fd, 'R');
     while (keep_running) {
-        int client_fd = accept(listener, NULL, NULL);
+        struct pollfd listener_poll = {.fd = listener, .events = POLLIN};
+        int poll_result = poll(&listener_poll, 1, 500);
+        int client_fd;
         pid_t child;
 
+        if (poll_result == 0) {
+            continue;
+        }
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(listener);
+            fp_remove_pid();
+            return -1;
+        }
+        client_fd = accept(listener, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("accept");
-            break;
+            close(listener);
+            fp_remove_pid();
+            return -1;
+        }
+        if (active_clients >= FP_MAX_CLIENTS) {
+            close(client_fd);
+            continue;
         }
         child = fork();
         if (child == 0) {
             close(listener);
+            (void)prctl(PR_SET_PDEATHSIG, SIGTERM);
+            if (drop_client_privileges() != 0) {
+                close(client_fd);
+                _exit(1);
+            }
             handle_client(client_fd, config);
             _exit(0);
+        }
+        if (child > 0) {
+            ++active_clients;
         }
         close(client_fd);
     }

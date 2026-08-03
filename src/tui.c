@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MIN_ROWS 20
+#define MIN_ROWS 22
 #define MIN_COLS 66
 
 struct ui_text {
@@ -27,6 +27,7 @@ struct ui_text {
     const char *enable;
     const char *disable;
     const char *startup;
+    const char *uninstall;
     const char *language;
     const char *refresh;
     const char *quit;
@@ -60,6 +61,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  修改 IPv4:端口 并启用代理",
          "d  停用代理",
          "a  切换开机自启",
+         "u  卸载 free_proxy",
          "l  切换语言（中文/English）",
          "r  立即刷新",
          "q  退出",
@@ -90,6 +92,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  Change IPv4:PORT and enable proxy",
          "d  Disable proxy",
          "a  Toggle boot startup",
+         "u  Uninstall free_proxy",
          "l  Switch language (中文/English)",
          "r  Refresh now",
          "q  Quit",
@@ -159,10 +162,11 @@ static void draw_screen(const struct fp_status *status, const struct ui_text *te
     mvprintw(11, 4, "%s", text->enable);
     mvprintw(12, 4, "%s", text->disable);
     mvprintw(13, 4, "%s", text->startup);
-    mvprintw(14, 4, "%s", text->language);
-    mvprintw(15, 4, "%s", text->refresh);
-    mvprintw(16, 4, "%s", text->quit);
-    mvprintw(17, 4, "%s", text->coverage);
+    mvprintw(14, 4, "%s", text->uninstall);
+    mvprintw(15, 4, "%s", text->language);
+    mvprintw(16, 4, "%s", text->refresh);
+    mvprintw(17, 4, "%s", text->quit);
+    mvprintw(18, 4, "%s", text->coverage);
 
     if (message[0] != '\0') {
         attron(A_BOLD);
@@ -277,7 +281,29 @@ static int prompt_proxy(char *proxy, size_t proxy_size, const struct ui_text *te
     return 0;
 }
 
-int fp_tui_run(const char *program_path) {
+static int confirm_uninstall(enum fp_ui_language language) {
+    char answer[8] = "";
+    int row = LINES - 4;
+
+    move(row, 2);
+    clrtoeol();
+    mvprintw(row, 4, "%s",
+             language == FP_UI_LANGUAGE_ZH ?
+                 "确认卸载？这会停止服务、删除规则和配置。输入 yes：" :
+                 "Confirm uninstall? Service, rules, and configuration will be removed. Type yes: ");
+    echo();
+    curs_set(1);
+    timeout(-1);
+    if (getnstr(answer, (int)sizeof(answer) - 1) == ERR) {
+        answer[0] = '\0';
+    }
+    noecho();
+    curs_set(0);
+    timeout(1000);
+    return strcmp(answer, "yes") == 0;
+}
+
+int fp_tui_run(void) {
     struct fp_status status;
     enum fp_ui_language language = fp_ui_language_load();
     const struct ui_text *text = &UI_TEXT[language];
@@ -307,7 +333,7 @@ int fp_tui_run(const char *program_path) {
             break;
         }
         if (key == 's' || key == 'S') {
-            if (fp_enable_saved_proxy(program_path) == 0) {
+            if (fp_enable_saved_proxy() == 0) {
                 (void)snprintf(message, sizeof(message),
                                language == FP_UI_LANGUAGE_ZH ? "已启用保存的代理配置。" :
                                                                "Saved proxy configuration enabled.");
@@ -319,7 +345,7 @@ int fp_tui_run(const char *program_path) {
 
             if (prompt_proxy(proxy, sizeof(proxy), text) != 0) {
                 (void)snprintf(message, sizeof(message), "%s", text->input_cancelled);
-            } else if (fp_enable_proxy(program_path, proxy) == 0) {
+            } else if (fp_enable_proxy(proxy) == 0) {
                 (void)snprintf(message, sizeof(message),
                                language == FP_UI_LANGUAGE_ZH ? "代理已启用：%s。" :
                                                                "Proxy enabled through %s.",
@@ -345,6 +371,18 @@ int fp_tui_run(const char *program_path) {
                                    (language == FP_UI_LANGUAGE_ZH ? "启用" : "enabled"));
             } else {
                 (void)snprintf(message, sizeof(message), "%s", text->startup_failed);
+            }
+        } else if (key == 'u' || key == 'U') {
+            if (!confirm_uninstall(language)) {
+                (void)snprintf(message, sizeof(message),
+                               language == FP_UI_LANGUAGE_ZH ? "已取消卸载。" :
+                                                               "Uninstall cancelled.");
+            } else if (fp_uninstall() == 0) {
+                break;
+            } else {
+                (void)snprintf(message, sizeof(message),
+                               language == FP_UI_LANGUAGE_ZH ? "卸载未能完整完成。" :
+                                                               "Uninstall was incomplete.");
             }
         } else if (key == 'l' || key == 'L') {
             enum fp_ui_language next =

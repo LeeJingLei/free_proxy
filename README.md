@@ -10,6 +10,8 @@
 
 Start a SOCKS5 service on the host and make it reachable from the VM.
 
+> **Important:** enable LAN access in the host proxy client (often called **Allow LAN**), or explicitly bind its SOCKS5 listener to the VM-facing host address / `0.0.0.0`. A listener bound only to `127.0.0.1` cannot be reached from the VM.
+
 - Bind the SOCKS5 listener to the host's VM-facing address or `0.0.0.0`, not only `127.0.0.1`.
 - Allow the SOCKS5 port through the host firewall.
 - Use the host IP visible from the VM. In NAT mode, this is often the VM's default gateway.
@@ -53,6 +55,8 @@ iptables      enabled
 
 Press `q` to exit the controller. The proxy remains enabled after the controller exits.
 
+`free_proxy` waits until the replacement forwarder has bound its local listener and installed complete firewall rules before reporting success. When you change the proxy address or port, the old forwarder is stopped before the new one starts.
+
 ## Interactive controller
 
 Run `sudo free_proxy` at any time to open the controller.
@@ -63,6 +67,7 @@ Run `sudo free_proxy` at any time to open the controller.
 | `e` | Change the SOCKS5 `IPv4:PORT` and enable it |
 | `d` | Disable the active proxy |
 | `a` | Enable or disable start at boot |
+| `u` | Uninstall after typing the exact confirmation `yes` |
 | `l` | Switch the controller between English and Chinese |
 | `r` | Refresh status |
 | `q` | Exit the controller |
@@ -80,6 +85,23 @@ sudo free_proxy disable
 ```
 
 `enable` saves the address in `/etc/free_proxy/config`, starts the local forwarder, and installs a dedicated iptables NAT chain. `disable` removes only rules created by `free_proxy`.
+
+## Upgrade and uninstall
+
+To upgrade, rebuild and reinstall:
+
+```sh
+make
+sudo make install
+```
+
+Press `u` in the controller and type `yes` to uninstall interactively. For scripts, use:
+
+```sh
+sudo free_proxy uninstall --yes
+```
+
+Uninstall stops the forwarder and its connection handlers, removes iptables rules and saved configuration, disables and removes the systemd unit, reloads systemd, and removes the installed binary.
 
 ## Start automatically at boot
 
@@ -126,5 +148,6 @@ Check the host proxy dashboard or connection log to confirm that the request rea
 - DNS, UDP (including QUIC), IPv6, and ICMP are not proxied.
 - Inbound connections, including SSH sessions into the VM, are not redirected.
 - SOCKS5 username/password authentication and proxy hostnames are not supported.
+- The forwarder limits active client handlers to 128. SOCKS5 connection attempts time out after 10 seconds, handshake I/O after 30 seconds, and idle proxied connections after 5 minutes.
 
 Disable IPv6 in the guest if IPv6 bypasses are unacceptable.
