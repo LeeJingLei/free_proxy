@@ -1,6 +1,8 @@
 #include "free_proxy.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -10,6 +12,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -147,25 +150,6 @@ static int is_legacy_daemon(pid_t pid) {
     }
     return strcmp(command + first_argument_length + 1, "run") == 0;
 }
-static int read_legacy_pid(pid_t *pid) {
-    FILE *file;
-    long parsed_pid;
-    char extra[2];
-    int matched;
-
-    file = fopen(FP_PID_PATH, "r");
-    if (file == NULL) {
-        return -1;
-    }
-    matched = fscanf(file, "%ld %1s", &parsed_pid, extra);
-    fclose(file);
-    if (matched != 1 || parsed_pid <= 1) {
-        return -1;
-    }
-    *pid = (pid_t)parsed_pid;
-    return 0;
-}
-
 static int stop_process(pid_t pid, unsigned long long start_time) {
     struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000L};
     pid_t signal_target = pid;
@@ -180,7 +164,10 @@ static int stop_process(pid_t pid, unsigned long long start_time) {
     for (attempts = 0; attempts < FP_STOP_TIMEOUT_MS / 100; ++attempts) {
         unsigned long long actual_start_time;
 
-        if (process_start_time(pid, &actual_start_time) != 0 || actual_start_time != start_time) {
+        if ((signal_target < 0 && kill(signal_target, 0) != 0 && errno == ESRCH) ||
+            (signal_target > 0 &&
+             (process_start_time(pid, &actual_start_time) != 0 ||
+              actual_start_time != start_time))) {
             return 0;
         }
         (void)waitpid(pid, NULL, WNOHANG);
@@ -192,7 +179,10 @@ static int stop_process(pid_t pid, unsigned long long start_time) {
     for (attempts = 0; attempts < 10; ++attempts) {
         unsigned long long actual_start_time;
 
-        if (process_start_time(pid, &actual_start_time) != 0 || actual_start_time != start_time) {
+        if ((signal_target < 0 && kill(signal_target, 0) != 0 && errno == ESRCH) ||
+            (signal_target > 0 &&
+             (process_start_time(pid, &actual_start_time) != 0 ||
+              actual_start_time != start_time))) {
             return 0;
         }
         nanosleep(&delay, NULL);
@@ -200,15 +190,57 @@ static int stop_process(pid_t pid, unsigned long long start_time) {
     return -1;
 }
 
-static int stop_legacy_daemon_from_pid_file(void) {
-    pid_t pid;
-    unsigned long long start_time;
+static int stop_untracked_daemons(void) {
+    DIR *directory = opendir("/proc");
+    struct dirent *entry;
 
-    if (read_legacy_pid(&pid) != 0 || !is_legacy_daemon(pid) ||
-        process_start_time(pid, &start_time) != 0) {
-        return 0;
+    if (directory == NULL) {
+        return -1;
     }
-    return stop_process(pid, start_time);
+    while ((entry = readdir(directory)) != NULL) {
+        char *end = NULL;
+        long value;
+        unsigned long long start_time;
+
+        if (!isdigit((unsigned char)entry->d_name[0])) {
+            continue;
+        }
+        errno = 0;
+        value = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || *end != '\0' || value <= 1 ||
+            !is_legacy_daemon((pid_t)value) ||
+            process_start_time((pid_t)value, &start_time) != 0) {
+            continue;
+        }
+        if (stop_process((pid_t)value, start_time) != 0) {
+            closedir(directory);
+            return -1;
+        }
+    }
+    closedir(directory);
+    return 0;
+}
+
+static int listener_is_released(void) {
+    int listener;
+    int option = 1;
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(FP_LISTEN_PORT),
+    };
+
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) {
+        return -1;
+    }
+    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) != 0 ||
+        bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(listener);
+        return -1;
+    }
+    close(listener);
+    return 0;
 }
 
 pid_t fp_read_pid(void) {
@@ -300,7 +332,7 @@ int fp_start_daemon(const struct fp_config *config) {
         }
         return -1;
     }
-    if (stop_legacy_daemon_from_pid_file() != 0) {
+    if (stop_untracked_daemons() != 0) {
         return -1;
     }
     fp_remove_pid();
@@ -349,17 +381,22 @@ int fp_stop_daemon(void) {
     unsigned long long start_time;
     struct fp_config config;
     if (read_process_record(&pid, &start_time, &config) != 0) {
-        if (stop_legacy_daemon_from_pid_file() != 0) {
+        if (stop_untracked_daemons() != 0 || listener_is_released() != 0) {
             return -1;
         }
         fp_remove_pid();
         return 0;
     }
     if (!process_is_ours(pid, start_time)) {
-        fp_remove_pid();
-        return 0;
+        if (stop_untracked_daemons() != 0) {
+            return -1;
+        }
+        return -1;
     }
     if (stop_process(pid, start_time) != 0) {
+        return -1;
+    }
+    if (stop_untracked_daemons() != 0 || listener_is_released() != 0) {
         return -1;
     }
     fp_remove_pid();

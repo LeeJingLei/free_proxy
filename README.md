@@ -67,6 +67,7 @@ Run `sudo free_proxy` at any time to open the controller.
 | `e` | Change the SOCKS5 `IPv4:PORT` and enable it |
 | `d` | Disable the active proxy |
 | `a` | Enable or disable start at boot |
+| `t` | Test the SOCKS5 connection |
 | `u` | Uninstall after typing the exact confirmation `yes` |
 | `l` | Switch the controller between English and Chinese |
 | `r` | Refresh status |

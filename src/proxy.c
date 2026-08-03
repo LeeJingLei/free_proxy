@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <linux/netfilter_ipv4.h>
 #include <poll.h>
@@ -47,6 +48,35 @@ static int set_socket_timeouts(int file_descriptor, int timeout_ms) {
                : -1;
 }
 
+static int connect_with_timeout(int file_descriptor, const struct sockaddr *address,
+                                socklen_t address_length, int timeout_ms) {
+    int original_flags = fcntl(file_descriptor, F_GETFL);
+    struct pollfd descriptor = {.fd = file_descriptor, .events = POLLOUT};
+    int socket_error = 0;
+    socklen_t socket_error_length = sizeof(socket_error);
+    int result;
+
+    if (original_flags < 0 || fcntl(file_descriptor, F_SETFL, original_flags | O_NONBLOCK) != 0) {
+        return -1;
+    }
+    result = connect(file_descriptor, address, address_length);
+    if (result != 0 && errno == EINPROGRESS) {
+        result = poll(&descriptor, 1, timeout_ms);
+        if (result > 0 &&
+            getsockopt(file_descriptor, SOL_SOCKET, SO_ERROR, &socket_error,
+                       &socket_error_length) == 0 &&
+            socket_error == 0) {
+            result = 0;
+        } else {
+            result = -1;
+        }
+    }
+    if (fcntl(file_descriptor, F_SETFL, original_flags) != 0) {
+        return -1;
+    }
+    return result;
+}
+
 static int write_all(int file_descriptor, const void *buffer, size_t length) {
     const unsigned char *cursor = buffer;
 
@@ -81,7 +111,8 @@ static int read_all(int file_descriptor, void *buffer, size_t length) {
     return 0;
 }
 
-static int connect_socks(const struct fp_config *config, const struct sockaddr_in *destination) {
+static int connect_socks(const struct fp_config *config, const struct sockaddr_in *destination,
+                         int connect_timeout_ms, int io_timeout_ms) {
     int socket_fd;
     unsigned char greeting[] = {0x05, 0x01, 0x00};
     unsigned char response[2];
@@ -93,9 +124,10 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
     };
 
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd < 0 || set_socket_timeouts(socket_fd, FP_CONNECT_TIMEOUT_MS) != 0 ||
-        connect(socket_fd, (struct sockaddr *)&proxy, sizeof(proxy)) != 0 ||
-        set_socket_timeouts(socket_fd, FP_IO_TIMEOUT_MS) != 0 ||
+    if (socket_fd < 0 ||
+        connect_with_timeout(socket_fd, (struct sockaddr *)&proxy, sizeof(proxy),
+                             connect_timeout_ms) != 0 ||
+        set_socket_timeouts(socket_fd, io_timeout_ms) != 0 ||
         write_all(socket_fd, greeting, sizeof(greeting)) != 0 ||
         read_all(socket_fd, response, sizeof(response)) != 0 || response[0] != 0x05 ||
         response[1] != 0x00) {
@@ -117,6 +149,42 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
         return -1;
     }
     return socket_fd;
+}
+
+int fp_test_proxy(void) {
+    struct fp_config config;
+    struct sockaddr_in listener = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(FP_LISTEN_PORT),
+    };
+    struct sockaddr_in destination = {
+        .sin_family = AF_INET,
+        .sin_port = htons(443),
+    };
+    int listener_fd;
+    int socket_fd;
+
+    if (fp_config_load(&config) != 0 || !fp_firewall_is_enabled(&config) ||
+        inet_pton(AF_INET, "1.1.1.1", &destination.sin_addr) != 1) {
+        return -1;
+    }
+    listener_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_fd < 0 ||
+        connect_with_timeout(listener_fd, (struct sockaddr *)&listener, sizeof(listener),
+                             FP_TEST_TIMEOUT_MS) != 0) {
+        if (listener_fd >= 0) {
+            close(listener_fd);
+        }
+        return -1;
+    }
+    close(listener_fd);
+    socket_fd = connect_socks(&config, &destination, FP_TEST_TIMEOUT_MS, FP_TEST_TIMEOUT_MS);
+    if (socket_fd < 0) {
+        return -1;
+    }
+    close(socket_fd);
+    return 0;
 }
 
 static void relay(int client_fd, int upstream_fd) {
@@ -176,7 +244,7 @@ static void handle_client(int client_fd, const struct fp_config *config) {
         close(client_fd);
         return;
     }
-    upstream_fd = connect_socks(config, &destination);
+    upstream_fd = connect_socks(config, &destination, FP_CONNECT_TIMEOUT_MS, FP_IO_TIMEOUT_MS);
     if (upstream_fd >= 0) {
         relay(client_fd, upstream_fd);
         close(upstream_fd);

@@ -33,6 +33,7 @@ int fp_enable_proxy(const char *proxy) {
     bool was_running;
     int result;
 
+    memset(&config, 0, sizeof(config));
     if (lock_fd < 0 || fp_parse_proxy(proxy, &config) != 0) {
         fp_lock_release(lock_fd);
         return -1;
@@ -77,6 +78,10 @@ int fp_disable_proxy(void) {
         return -1;
     }
     daemon_result = fp_stop_daemon();
+    if (daemon_result != 0) {
+        fp_lock_release(lock_fd);
+        return -1;
+    }
     firewall_result = fp_firewall_disable();
     fp_lock_release(lock_fd);
     return firewall_result == 0 && daemon_result == 0 ? 0 : -1;
@@ -91,9 +96,21 @@ int fp_uninstall(void) {
     if (lock_fd < 0) {
         return -1;
     }
-    stop_result = fp_stop_daemon();
-    firewall_result = fp_firewall_disable();
     service_result = fp_autostart_remove();
+    if (service_result != 0) {
+        fp_lock_release(lock_fd);
+        return -1;
+    }
+    stop_result = fp_stop_daemon();
+    if (stop_result != 0) {
+        fp_lock_release(lock_fd);
+        return -1;
+    }
+    firewall_result = fp_firewall_disable();
+    if (firewall_result != 0) {
+        fp_lock_release(lock_fd);
+        return -1;
+    }
     fp_remove_pid();
     (void)unlink(FP_CONFIG_PATH);
     (void)unlink(FP_UI_LANGUAGE_PATH);

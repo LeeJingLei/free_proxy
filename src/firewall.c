@@ -91,7 +91,11 @@ int fp_firewall_enable(const struct fp_config *config) {
         return -1;
     }
     if (run_iptables(flush_chain) != 0 || run_iptables(exclude_proxy) != 0 ||
-        run_iptables(exclude_loopback) != 0 || run_iptables(redirect) != 0) {
+        run_iptables(exclude_loopback) != 0) {
+        (void)fp_firewall_disable();
+        return -1;
+    }
+    if (run_iptables(redirect) != 0) {
         (void)fp_firewall_disable();
         return -1;
     }

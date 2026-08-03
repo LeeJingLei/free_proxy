@@ -120,10 +120,12 @@ int fp_config_load(struct fp_config *config) {
     if (file == NULL) {
         return -1;
     }
-    if (fgets(line, sizeof(line), file) != NULL &&
-        strncmp(line, "proxy=", 6) == 0) {
+    memset(config, 0, sizeof(*config));
+    while (fgets(line, sizeof(line), file) != NULL) {
         line[strcspn(line, "\r\n")] = '\0';
-        result = fp_parse_proxy(line + 6, config);
+        if (strncmp(line, "proxy=", 6) == 0) {
+            result = fp_parse_proxy(line + 6, config);
+        }
     }
     fclose(file);
     return result;

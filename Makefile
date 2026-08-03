@@ -36,6 +36,7 @@ install: $(TARGET)
 uninstall:
 	-/usr/local/bin/free_proxy uninstall --yes
 	-systemctl disable --now free_proxy.service
+	rm -rf /etc/free_proxy /run/free_proxy
 	rm -f /etc/systemd/system/free_proxy.service /usr/local/bin/free_proxy
 	systemctl daemon-reload
 

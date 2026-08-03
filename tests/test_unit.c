@@ -9,6 +9,7 @@
 static void test_proxy_parser(void) {
     struct fp_config config;
 
+    memset(&config, 0, sizeof(config));
     assert(fp_parse_proxy("192.168.3.2:10808", &config) == 0);
     assert(config.proxy_port == 10808);
     assert(fp_parse_proxy("invalid:10808", &config) != 0);

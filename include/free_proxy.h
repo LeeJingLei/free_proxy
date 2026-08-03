@@ -3,6 +3,7 @@
 
 #include <netinet/in.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <sys/types.h>
 
 #define FP_CONFIG_DIR "/etc/free_proxy"
@@ -16,6 +17,7 @@
 #define FP_START_TIMEOUT_MS 5000
 #define FP_STOP_TIMEOUT_MS 5000
 #define FP_CONNECT_TIMEOUT_MS 10000
+#define FP_TEST_TIMEOUT_MS 3000
 #define FP_IO_TIMEOUT_MS 30000
 #define FP_IDLE_TIMEOUT_MS 300000
 #define FP_MAX_CLIENTS 128
@@ -62,6 +64,7 @@ bool fp_daemon_matches_config(const struct fp_config *config);
 
 int fp_proxy_run(const struct fp_config *config, int ready_fd);
 int fp_socks5_drain_bind(int socket_fd);
+int fp_test_proxy(void);
 
 int fp_autostart_enable(void);
 int fp_autostart_disable(void);

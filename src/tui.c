@@ -27,6 +27,7 @@ struct ui_text {
     const char *enable;
     const char *disable;
     const char *startup;
+    const char *test;
     const char *uninstall;
     const char *language;
     const char *refresh;
@@ -61,6 +62,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  修改 IPv4:端口 并启用代理",
          "d  停用代理",
          "a  切换开机自启",
+         "t  测试代理连接",
          "u  卸载 free_proxy",
          "l  切换语言（中文/English）",
          "r  立即刷新",
@@ -92,6 +94,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  Change IPv4:PORT and enable proxy",
          "d  Disable proxy",
          "a  Toggle boot startup",
+         "t  Test proxy connection",
          "u  Uninstall free_proxy",
          "l  Switch language (中文/English)",
          "r  Refresh now",
@@ -162,11 +165,12 @@ static void draw_screen(const struct fp_status *status, const struct ui_text *te
     mvprintw(11, 4, "%s", text->enable);
     mvprintw(12, 4, "%s", text->disable);
     mvprintw(13, 4, "%s", text->startup);
-    mvprintw(14, 4, "%s", text->uninstall);
-    mvprintw(15, 4, "%s", text->language);
-    mvprintw(16, 4, "%s", text->refresh);
-    mvprintw(17, 4, "%s", text->quit);
-    mvprintw(18, 4, "%s", text->coverage);
+    mvprintw(14, 4, "%s", text->test);
+    mvprintw(15, 4, "%s", text->uninstall);
+    mvprintw(16, 4, "%s", text->language);
+    mvprintw(17, 4, "%s", text->refresh);
+    mvprintw(18, 4, "%s", text->quit);
+    mvprintw(19, 4, "%s", text->coverage);
 
     if (message[0] != '\0') {
         attron(A_BOLD);
@@ -371,6 +375,22 @@ int fp_tui_run(void) {
                                    (language == FP_UI_LANGUAGE_ZH ? "启用" : "enabled"));
             } else {
                 (void)snprintf(message, sizeof(message), "%s", text->startup_failed);
+            }
+        } else if (key == 't' || key == 'T') {
+            (void)snprintf(message, sizeof(message),
+                           language == FP_UI_LANGUAGE_ZH ? "正在测试代理连接，请稍候…" :
+                                                           "Testing proxy connection…");
+            draw_screen(&status, text, message);
+            if (fp_test_proxy() == 0) {
+                (void)snprintf(message, sizeof(message),
+                               language == FP_UI_LANGUAGE_ZH ?
+                                   "测试通过：SOCKS5 已成功连接到 1.1.1.1:443。" :
+                                   "Test passed: SOCKS5 connected to 1.1.1.1:443.");
+            } else {
+                (void)snprintf(message, sizeof(message),
+                               language == FP_UI_LANGUAGE_ZH ?
+                                   "测试失败：请确认服务、规则和宿主机 SOCKS5 可用。" :
+                                   "Test failed: check the forwarder, rules, and host SOCKS5.");
             }
         } else if (key == 'u' || key == 'U') {
             if (!confirm_uninstall(language)) {
