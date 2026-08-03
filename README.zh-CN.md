@@ -1,0 +1,130 @@
+# free_proxy
+
+[English](README.md) | 中文
+
+`free_proxy` 会将 Linux 虚拟机本机发起的 IPv4 TCP 流量透明转发到无认证 SOCKS5 代理。它适用于在宿主机运行代理，并希望虚拟机内的 `apt`、`git`、`ssh`、浏览器和编辑器扩展无需逐个设置代理即可使用该代理的场景。
+
+## 快速开始
+
+### 1. 准备宿主机代理
+
+先在宿主机启动 SOCKS5 服务，并确保虚拟机能够访问它。
+
+- SOCKS5 监听地址应是面向虚拟机的宿主机地址或 `0.0.0.0`，不能只监听 `127.0.0.1`。
+- 在宿主机防火墙中放行 SOCKS5 端口。
+- 使用虚拟机能访问到的宿主机 IP；在 NAT 模式下，它通常是虚拟机的默认网关。
+- 当前版本只支持 IPv4、无用户名和密码认证的 SOCKS5 服务。
+
+安装 `free_proxy` 前，请先在虚拟机中确认能直连 SOCKS5：
+
+```sh
+curl --socks5-hostname 192.168.3.2:10808 https://api.ipify.org
+```
+
+将 `192.168.3.2:10808` 替换为你的宿主机 SOCKS5 地址和端口。
+
+### 2. 安装
+
+在 Ubuntu 或 Debian 上执行：
+
+```sh
+sudo apt update
+sudo apt install build-essential libncurses-dev iptables
+make
+sudo make install
+```
+
+安装后的命令为 `/usr/local/bin/free_proxy`。
+
+### 3. 配置并启用
+
+打开交互式控制界面：
+
+```sh
+sudo free_proxy
+```
+
+按 `e`，输入宿主机代理的 `IPv4:端口`，例如 `192.168.3.2:10808`，然后按 Enter。成功后界面应显示：
+
+```text
+转发服务  运行中
+iptables  已启用
+```
+
+按 `q` 退出控制界面。退出界面不会关闭已经启用的代理。
+
+## 交互式控制界面
+
+任何时候执行 `sudo free_proxy` 都可以打开控制界面。
+
+| 按键 | 操作 |
+| --- | --- |
+| `s` | 直接启用已经保存的代理地址 |
+| `e` | 修改 SOCKS5 的 `IPv4:端口` 并启用 |
+| `d` | 停用当前代理 |
+| `a` | 启用或停用开机自启 |
+| `l` | 切换中文或 English 界面 |
+| `r` | 立即刷新状态 |
+| `q` | 退出控制界面 |
+
+代理输入框支持主键盘和数字小键盘。输入时按 `q` 或 `Esc` 会取消输入并返回主界面，不会修改现有配置。
+
+## 命令行用法
+
+日常推荐使用交互界面。以下命令适合脚本调用：
+
+```sh
+sudo free_proxy enable --proxy 192.168.3.2:10808
+sudo free_proxy status
+sudo free_proxy disable
+```
+
+`enable` 会将地址保存至 `/etc/free_proxy/config`，启动本地转发服务并创建专用 iptables NAT 链。`disable` 只会删除 `free_proxy` 创建的规则。
+
+## 开机自动启动
+
+请先执行 `sudo make install`，并至少成功配置过一次代理。随后在控制界面中按 `a`，或执行：
+
+```sh
+sudo free_proxy autostart enable
+```
+
+取消开机自启：
+
+```sh
+sudo free_proxy autostart disable
+```
+
+## 验证是否生效
+
+在控制界面中确认“转发服务”为“运行中”且“iptables”为“已启用”，或执行：
+
+```sh
+sudo free_proxy status
+```
+
+还可以测试 HTTP(S) 请求：
+
+```sh
+curl -4 https://api.ipify.org
+```
+
+请在宿主机代理客户端的面板或连接日志中确认该请求出现。公网 IP 不一定发生变化：当虚拟机直连和宿主机代理使用同一条网络出口时，两者可能显示相同 IP。
+
+## 常见问题
+
+| 问题 | 检查方式 |
+| --- | --- |
+| 启用后无法联网 | 确认宿主机 IP 和端口，并先执行快速开始中的显式 SOCKS5 `curl` 测试。 |
+| 界面显示 `iptables 已禁用` | 执行 `sudo free_proxy`，按 `s` 后确认状态变为已启用。 |
+| 无法开启开机自启 | 先执行 `sudo make install`，之后使用 `/usr/local/bin/free_proxy`，不要只运行 `build/free_proxy`。 |
+| `apt` 可用但 `ping` 失败 | 这是预期行为：`ping` 使用 ICMP，当前 TCP 代理无法处理。 |
+
+## 限制
+
+- 仅代理本机发起的 IPv4 TCP 流量。
+- DNS、UDP（包括 QUIC）、IPv6 和 ICMP 不走代理。
+- 进入虚拟机的入站连接（包括 SSH 登录）不会被重定向。
+- 不支持 SOCKS5 用户名/密码认证，也不支持将代理服务器写为域名。
+
+如果不能接受 IPv6 绕过，请在虚拟机中禁用 IPv6。
