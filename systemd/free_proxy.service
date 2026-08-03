@@ -1,0 +1,13 @@
+[Unit]
+Description=free_proxy transparent SOCKS5 proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/free_proxy run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
