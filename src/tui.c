@@ -1,9 +1,13 @@
 #include "free_proxy.h"
 
+#include <errno.h>
 #include <locale.h>
 #include <ncursesw/ncurses.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #define MIN_ROWS 22
 #define MIN_COLS 66
@@ -62,7 +66,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  修改 IPv4:端口 并启用代理",
          "d  停用代理",
          "a  切换开机自启",
-         "t  测试代理连接",
+         "t  打开网络测试页",
          "u  卸载 free_proxy",
          "l  切换语言（中文/English）",
          "r  立即刷新",
@@ -94,7 +98,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  Change IPv4:PORT and enable proxy",
          "d  Disable proxy",
          "a  Toggle boot startup",
-         "t  Test proxy connection",
+         "t  Open network test page",
          "u  Uninstall free_proxy",
          "l  Switch language (中文/English)",
          "r  Refresh now",
@@ -178,6 +182,416 @@ static void draw_screen(const struct fp_status *status, const struct ui_text *te
         attroff(A_BOLD);
     }
     refresh();
+}
+
+struct test_worker_args {
+    enum fp_test_mode mode;
+    struct fp_test_report *report;
+    int event_fd;
+    volatile sig_atomic_t *cancel_flag;
+};
+
+static void write_test_event(const struct fp_test_progress_event *event, void *context) {
+    struct test_worker_args *args = context;
+    const unsigned char *cursor = (const unsigned char *)event;
+    size_t remaining = sizeof(*event);
+
+    while (remaining > 0) {
+        ssize_t written = write(args->event_fd, cursor, remaining);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+}
+
+static void *test_worker_main(void *context) {
+    struct test_worker_args *args = context;
+
+    (void)fp_test_run(args->mode, args->report, write_test_event, args, args->cancel_flag);
+    return NULL;
+}
+
+static int read_test_event(int event_fd, struct fp_test_progress_event *event) {
+    unsigned char *cursor = (unsigned char *)event;
+    size_t remaining = sizeof(*event);
+
+    while (remaining > 0) {
+        ssize_t received = read(event_fd, cursor, remaining);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            return -1;
+        }
+        cursor += received;
+        remaining -= (size_t)received;
+    }
+    return 0;
+}
+
+static void draw_test_menu(enum fp_ui_language language) {
+    const char *title = language == FP_UI_LANGUAGE_ZH ? "网络测试" : "Network test";
+    const char *choose =
+        language == FP_UI_LANGUAGE_ZH ? "请选择测试类型：" : "Choose a test type:";
+    const char *connectivity =
+        language == FP_UI_LANGUAGE_ZH ? "1  网页连通性" : "1  Site connectivity";
+    const char *latency =
+        language == FP_UI_LANGUAGE_ZH ? "2  延迟测试" : "2  Latency test";
+    const char *speed =
+        language == FP_UI_LANGUAGE_ZH ? "3  下载测速" : "3  Download speed";
+    const char *back =
+        language == FP_UI_LANGUAGE_ZH ? "q  返回主界面" : "q  Back to main screen";
+
+    erase();
+    attron(A_BOLD | A_UNDERLINE);
+    mvprintw(2, 4, "%s", title);
+    attroff(A_BOLD | A_UNDERLINE);
+    mvhline(3, 2, '-', COLS - 4);
+    mvprintw(5, 4, "%s", choose);
+    mvprintw(7, 4, "%s", connectivity);
+    mvprintw(8, 4, "%s", latency);
+    mvprintw(9, 4, "%s", speed);
+    attron(A_BOLD);
+    mvprintw(LINES - 2, 4, "%s", back);
+    attroff(A_BOLD);
+    refresh();
+}
+
+static void draw_test_progress(enum fp_ui_language language, enum fp_test_mode mode,
+                               const struct fp_test_progress_event *event, int cancelling) {
+    const char *title = language == FP_UI_LANGUAGE_ZH ? "网络测试" : "Network test";
+    const char *hint = language == FP_UI_LANGUAGE_ZH ? "按 q 取消测试" : "Press q to cancel";
+    const char *wait = language == FP_UI_LANGUAGE_ZH ? "正在取消…" : "Cancelling…";
+    char line[192];
+    char detail[160];
+
+    erase();
+    attron(A_BOLD | A_UNDERLINE);
+    mvprintw(2, 4, "%s", title);
+    attroff(A_BOLD | A_UNDERLINE);
+    mvhline(3, 2, '-', COLS - 4);
+
+    detail[0] = '\0';
+    if (event->phase == FP_TEST_PHASE_PREFLIGHT) {
+        (void)snprintf(line, sizeof(line),
+                       language == FP_UI_LANGUAGE_ZH ? "正在检查本地转发服务…" :
+                                                       "Checking local forwarder…");
+    } else if (event->phase == FP_TEST_PHASE_CONNECTIVITY) {
+        if (event->state == FP_TEST_SITE_RUNNING) {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ?
+                               "连通性 %zu/%zu：%s (%s)…" :
+                               "Connectivity %zu/%zu: %s (%s)…",
+                           event->index, event->total, event->name, event->domain);
+        } else if (event->state == FP_TEST_SITE_OK) {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ? "连通性 %zu/%zu：%s  成功" :
+                                                           "Connectivity %zu/%zu: %s  OK",
+                           event->index, event->total, event->name);
+        } else {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ? "连通性 %zu/%zu：%s  失败" :
+                                                           "Connectivity %zu/%zu: %s  failed",
+                           event->index, event->total, event->name);
+        }
+    } else if (event->phase == FP_TEST_PHASE_LATENCY) {
+        if (event->state == FP_TEST_SITE_RUNNING) {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ? "延迟 %zu/%zu：%s (%s)…" :
+                                                           "Latency %zu/%zu: %s (%s)…",
+                           event->index, event->total, event->name, event->domain);
+        } else if (event->state == FP_TEST_SITE_OK) {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ? "延迟 %zu/%zu：%s  %d ms" :
+                                                           "Latency %zu/%zu: %s  %d ms",
+                           event->index, event->total, event->name, event->latency_ms);
+        } else {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ? "延迟 %zu/%zu：%s  失败" :
+                                                           "Latency %zu/%zu: %s  failed",
+                           event->index, event->total, event->name);
+        }
+    } else if (event->phase == FP_TEST_PHASE_SPEED) {
+        if (event->state == FP_TEST_SITE_RUNNING) {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ?
+                               "测速 %zu/%zu：%s（最多 10 MiB）" :
+                               "Speed %zu/%zu: %s (up to 10 MiB)",
+                           event->index, event->total, event->name);
+            (void)snprintf(detail, sizeof(detail),
+                           language == FP_UI_LANGUAGE_ZH ?
+                               "实时速度：%.2f Mbps    已下载：%zu / %u bytes" :
+                               "Live speed: %.2f Mbps    Downloaded: %zu / %u bytes",
+                           event->speed_mbps, event->bytes_downloaded, FP_TEST_SPEED_MAX_BYTES);
+        } else if (event->state == FP_TEST_SITE_OK) {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ?
+                               "测速 %zu/%zu：%s  完成 %.2f Mbps" :
+                               "Speed %zu/%zu: %s  done %.2f Mbps",
+                           event->index, event->total, event->name, event->speed_mbps);
+            (void)snprintf(detail, sizeof(detail),
+                           language == FP_UI_LANGUAGE_ZH ? "下载量：%zu bytes" :
+                                                           "Downloaded: %zu bytes",
+                           event->bytes_downloaded);
+        } else {
+            (void)snprintf(line, sizeof(line),
+                           language == FP_UI_LANGUAGE_ZH ? "测速 %zu/%zu：%s  失败" :
+                                                           "Speed %zu/%zu: %s  failed",
+                           event->index, event->total, event->name);
+        }
+    } else {
+        (void)snprintf(line, sizeof(line),
+                       language == FP_UI_LANGUAGE_ZH ? "正在汇总结果…" : "Summarizing results…");
+    }
+
+    (void)mode;
+    mvprintw(6, 4, "%.*s", COLS - 8, line);
+    if (detail[0] != '\0') {
+        attron(A_BOLD);
+        mvprintw(8, 4, "%.*s", COLS - 8, detail);
+        attroff(A_BOLD);
+    }
+    attron(A_BOLD);
+    mvprintw(LINES - 2, 4, "%s", cancelling ? wait : hint);
+    attroff(A_BOLD);
+    refresh();
+}
+
+static void draw_test_results(enum fp_ui_language language, const struct fp_test_report *report) {
+    const char *heading = language == FP_UI_LANGUAGE_ZH ? "测试结果" : "Test results";
+    const char *failed = language == FP_UI_LANGUAGE_ZH ? "失败目标" : "Failed targets";
+    const char *none = language == FP_UI_LANGUAGE_ZH ? "无" : "None";
+    const char *cancelled = language == FP_UI_LANGUAGE_ZH ? "测试已取消。" : "Test cancelled.";
+    const char *preflight =
+        language == FP_UI_LANGUAGE_ZH ?
+            "预检失败：请确认服务、规则和宿主机 SOCKS5 可用。" :
+            "Preflight failed: check the forwarder, rules, and host SOCKS5.";
+    const char *continue_text =
+        language == FP_UI_LANGUAGE_ZH ? "按任意键返回测试菜单" : "Press any key to return to menu";
+    int row = 5;
+    size_t index;
+    size_t position = 0;
+    int latency_sum = 0;
+    size_t latency_count = 0;
+
+    erase();
+    attron(A_BOLD | A_UNDERLINE);
+    mvprintw(2, 4, "%s", heading);
+    attroff(A_BOLD | A_UNDERLINE);
+    mvhline(3, 2, '-', COLS - 4);
+
+    if (!report->listener_ok) {
+        mvprintw(5, 4, "%s", preflight);
+    } else {
+        if (report->cancelled) {
+            mvprintw(row++, 4, "%s", cancelled);
+        }
+        if (report->mode == FP_TEST_MODE_CONNECTIVITY) {
+            mvprintw(row++, 4,
+                     language == FP_UI_LANGUAGE_ZH ? "连通性：%zu/%zu 成功" :
+                                                     "Connectivity: %zu/%zu passed",
+                     report->sites_passed, report->site_count);
+        } else if (report->mode == FP_TEST_MODE_LATENCY) {
+            for (index = 0; index < report->site_count; ++index) {
+                if (report->sites[index].state == FP_TEST_SITE_OK &&
+                    report->sites[index].latency_ms >= 0) {
+                    latency_sum += report->sites[index].latency_ms;
+                    ++latency_count;
+                }
+            }
+            if (latency_count > 0) {
+                mvprintw(row++, 4,
+                         language == FP_UI_LANGUAGE_ZH ?
+                             "延迟：%zu/%zu 成功，平均 %d ms" :
+                             "Latency: %zu/%zu passed, avg %d ms",
+                         report->sites_passed, report->site_count,
+                         latency_sum / (int)latency_count);
+            } else {
+                mvprintw(row++, 4,
+                         language == FP_UI_LANGUAGE_ZH ? "延迟：%zu/%zu 成功" :
+                                                         "Latency: %zu/%zu passed",
+                         report->sites_passed, report->site_count);
+            }
+            for (index = 0; index < report->site_count && row < LINES - 5; ++index) {
+                const struct fp_test_site_result *site = &report->sites[index];
+
+                if (site->state == FP_TEST_SITE_OK) {
+                    mvprintw(row++, 6, "%-18s %4d ms", site->name, site->latency_ms);
+                } else if (site->state == FP_TEST_SITE_FAIL) {
+                    mvprintw(row++, 6, "%-18s FAIL", site->name);
+                }
+            }
+        } else {
+            mvprintw(row++, 4,
+                     language == FP_UI_LANGUAGE_ZH ?
+                         "测速：%zu/%zu 成功，峰值 %.2f Mbps" :
+                         "Speed: %zu/%zu passed, peak %.2f Mbps",
+                     report->speed_passed, report->speed_count, report->best_speed_mbps);
+            for (index = 0; index < report->speed_count && row < LINES - 5; ++index) {
+                const struct fp_test_site_result *item = &report->speed[index];
+                const char *mark = item->state == FP_TEST_SITE_OK        ? "OK" :
+                                   item->state == FP_TEST_SITE_FAIL      ? "FAIL" :
+                                   item->state == FP_TEST_SITE_CANCELLED ? "SKIP" :
+                                                                          "...";
+
+                if (item->state == FP_TEST_SITE_OK) {
+                    mvprintw(row++, 6, "%-4s %-18s %6.2f Mbps  (%zu bytes)", mark, item->name,
+                             item->speed_mbps, item->bytes_downloaded);
+                } else if (item->state != FP_TEST_SITE_PENDING) {
+                    mvprintw(row++, 6, "%-4s %-18s", mark, item->name);
+                }
+            }
+        }
+        if (row < LINES - 3) {
+            attron(A_BOLD);
+            mvprintw(row++, 4, "%s:", failed);
+            attroff(A_BOLD);
+            if (report->failures[0] == '\0') {
+                mvprintw(row, 4, "%s", none);
+            } else {
+                while (report->failures[position] != '\0' && row < LINES - 3) {
+                    size_t remaining = strlen(report->failures + position);
+                    int width = COLS - 8;
+                    int length = (int)(remaining > (size_t)width ? (size_t)width : remaining);
+
+                    mvprintw(row++, 4, "%.*s", length, report->failures + position);
+                    position += (size_t)length;
+                }
+            }
+        }
+    }
+
+    attron(A_BOLD);
+    mvprintw(LINES - 2, 4, "%s", continue_text);
+    attroff(A_BOLD);
+    refresh();
+    timeout(-1);
+    (void)getch();
+}
+
+static void run_selected_test(enum fp_ui_language language, enum fp_test_mode mode, char *message,
+                              size_t message_size) {
+    struct fp_test_report report;
+    struct fp_test_progress_event event;
+    struct test_worker_args args;
+    pthread_t worker;
+    volatile sig_atomic_t cancel_flag = 0;
+    int pipe_fds[2];
+    int cancelling = 0;
+    int finished = 0;
+
+    memset(&report, 0, sizeof(report));
+    memset(&event, 0, sizeof(event));
+    event.phase = FP_TEST_PHASE_PREFLIGHT;
+    event.index = 1;
+    event.total = 1;
+
+    if (pipe(pipe_fds) != 0) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "无法启动测试。" : "Unable to start test.");
+        return;
+    }
+
+    args.mode = mode;
+    args.report = &report;
+    args.event_fd = pipe_fds[1];
+    args.cancel_flag = &cancel_flag;
+    draw_test_progress(language, mode, &event, 0);
+    if (pthread_create(&worker, NULL, test_worker_main, &args) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "无法启动测试。" : "Unable to start test.");
+        return;
+    }
+
+    timeout(-1);
+    nodelay(stdscr, TRUE);
+    while (!finished) {
+        struct pollfd descriptors[1] = {{.fd = pipe_fds[0], .events = POLLIN}};
+        int key = getch();
+        int poll_result;
+
+        if ((key == 'q' || key == 'Q') && !cancelling) {
+            cancel_flag = 1;
+            cancelling = 1;
+            draw_test_progress(language, mode, &event, 1);
+        }
+        poll_result = poll(descriptors, 1, 100);
+        if (poll_result > 0 && (descriptors[0].revents & POLLIN) != 0) {
+            if (read_test_event(pipe_fds[0], &event) == 0) {
+                if (event.phase == FP_TEST_PHASE_DONE) {
+                    finished = 1;
+                } else {
+                    draw_test_progress(language, mode, &event, cancelling);
+                }
+            } else {
+                finished = 1;
+            }
+        } else if (poll_result < 0 && errno != EINTR) {
+            finished = 1;
+        }
+    }
+    nodelay(stdscr, FALSE);
+    (void)pthread_join(worker, NULL);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    draw_test_results(language, &report);
+
+    if (!report.listener_ok) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ?
+                           "测试失败：请确认服务、规则和宿主机 SOCKS5 可用。" :
+                           "Test failed: check the forwarder, rules, and host SOCKS5.");
+    } else if (report.cancelled) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "测试已取消。" : "Test cancelled.");
+    } else if (mode == FP_TEST_MODE_SPEED) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ?
+                           "测速完成：%zu/%zu，峰值 %.2f Mbps。" :
+                           "Speed test done: %zu/%zu, peak %.2f Mbps.",
+                       report.speed_passed, report.speed_count, report.best_speed_mbps);
+    } else if (mode == FP_TEST_MODE_LATENCY) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "延迟测试完成：%zu/%zu。" :
+                                                       "Latency test done: %zu/%zu.",
+                       report.sites_passed, report.site_count);
+    } else {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "连通性测试完成：%zu/%zu。" :
+                                                       "Connectivity test done: %zu/%zu.",
+                       report.sites_passed, report.site_count);
+    }
+}
+
+static void run_test_page(enum fp_ui_language language, char *message, size_t message_size) {
+    timeout(-1);
+    for (;;) {
+        int key;
+
+        draw_test_menu(language);
+        key = getch();
+        if (key == 'q' || key == 'Q') {
+            (void)snprintf(message, message_size,
+                           language == FP_UI_LANGUAGE_ZH ? "已返回主界面。" :
+                                                           "Returned to main screen.");
+            break;
+        }
+        if (key == '1') {
+            run_selected_test(language, FP_TEST_MODE_CONNECTIVITY, message, message_size);
+        } else if (key == '2') {
+            run_selected_test(language, FP_TEST_MODE_LATENCY, message, message_size);
+        } else if (key == '3') {
+            run_selected_test(language, FP_TEST_MODE_SPEED, message, message_size);
+        }
+    }
+    timeout(1000);
 }
 
 static int keypad_digit(int key) {
@@ -377,21 +791,7 @@ int fp_tui_run(void) {
                 (void)snprintf(message, sizeof(message), "%s", text->startup_failed);
             }
         } else if (key == 't' || key == 'T') {
-            (void)snprintf(message, sizeof(message),
-                           language == FP_UI_LANGUAGE_ZH ? "正在测试代理连接，请稍候…" :
-                                                           "Testing proxy connection…");
-            draw_screen(&status, text, message);
-            if (fp_test_proxy() == 0) {
-                (void)snprintf(message, sizeof(message),
-                               language == FP_UI_LANGUAGE_ZH ?
-                                   "测试通过：SOCKS5 已成功连接到 1.1.1.1:443。" :
-                                   "Test passed: SOCKS5 connected to 1.1.1.1:443.");
-            } else {
-                (void)snprintf(message, sizeof(message),
-                               language == FP_UI_LANGUAGE_ZH ?
-                                   "测试失败：请确认服务、规则和宿主机 SOCKS5 可用。" :
-                                   "Test failed: check the forwarder, rules, and host SOCKS5.");
-            }
+            run_test_page(language, message, sizeof(message));
         } else if (key == 'u' || key == 'U') {
             if (!confirm_uninstall(language)) {
                 (void)snprintf(message, sizeof(message),

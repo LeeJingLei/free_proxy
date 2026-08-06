@@ -1,7 +1,7 @@
 CC ?= cc
 CPPFLAGS := -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -Iinclude
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
-LDLIBS := -lncursesw
+LDLIBS := -lncursesw -lpthread
 
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/free_proxy

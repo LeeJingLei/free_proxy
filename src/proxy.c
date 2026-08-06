@@ -111,12 +111,10 @@ static int read_all(int file_descriptor, void *buffer, size_t length) {
     return 0;
 }
 
-static int connect_socks(const struct fp_config *config, const struct sockaddr_in *destination,
-                         int connect_timeout_ms, int io_timeout_ms) {
+static int open_socks(const struct fp_config *config, int connect_timeout_ms, int io_timeout_ms) {
     int socket_fd;
     unsigned char greeting[] = {0x05, 0x01, 0x00};
     unsigned char response[2];
-    unsigned char request[10] = {0x05, 0x01, 0x00, 0x01};
     struct sockaddr_in proxy = {
         .sin_family = AF_INET,
         .sin_addr = config->proxy_addr,
@@ -136,6 +134,18 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
         }
         return -1;
     }
+    return socket_fd;
+}
+
+static int connect_socks(const struct fp_config *config, const struct sockaddr_in *destination,
+                         int connect_timeout_ms, int io_timeout_ms) {
+    int socket_fd = open_socks(config, connect_timeout_ms, io_timeout_ms);
+    unsigned char response[2];
+    unsigned char request[10] = {0x05, 0x01, 0x00, 0x01};
+
+    if (socket_fd < 0) {
+        return -1;
+    }
     memcpy(request + 4, &destination->sin_addr, 4);
     memcpy(request + 8, &destination->sin_port, 2);
     if (write_all(socket_fd, request, sizeof(request)) != 0 ||
@@ -149,42 +159,6 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
         return -1;
     }
     return socket_fd;
-}
-
-int fp_test_proxy(void) {
-    struct fp_config config;
-    struct sockaddr_in listener = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-        .sin_port = htons(FP_LISTEN_PORT),
-    };
-    struct sockaddr_in destination = {
-        .sin_family = AF_INET,
-        .sin_port = htons(443),
-    };
-    int listener_fd;
-    int socket_fd;
-
-    if (fp_config_load(&config) != 0 || !fp_firewall_is_enabled(&config) ||
-        inet_pton(AF_INET, "1.1.1.1", &destination.sin_addr) != 1) {
-        return -1;
-    }
-    listener_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener_fd < 0 ||
-        connect_with_timeout(listener_fd, (struct sockaddr *)&listener, sizeof(listener),
-                             FP_TEST_TIMEOUT_MS) != 0) {
-        if (listener_fd >= 0) {
-            close(listener_fd);
-        }
-        return -1;
-    }
-    close(listener_fd);
-    socket_fd = connect_socks(&config, &destination, FP_TEST_TIMEOUT_MS, FP_TEST_TIMEOUT_MS);
-    if (socket_fd < 0) {
-        return -1;
-    }
-    close(socket_fd);
-    return 0;
 }
 
 static void relay(int client_fd, int upstream_fd) {

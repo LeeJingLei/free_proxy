@@ -2,6 +2,7 @@
 #define FREE_PROXY_H
 
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -18,6 +19,13 @@
 #define FP_STOP_TIMEOUT_MS 5000
 #define FP_CONNECT_TIMEOUT_MS 10000
 #define FP_TEST_TIMEOUT_MS 3000
+#define FP_TEST_SPEED_CONNECT_MS 5000
+#define FP_TEST_SPEED_STALL_MS 10000
+#define FP_TEST_SPEED_TOTAL_MS 60000
+#define FP_TEST_SPEED_MAX_BYTES (10U * 1024U * 1024U)
+#define FP_TEST_MAX_SITES 25
+#define FP_TEST_MAX_SPEED 3
+#define FP_TEST_FAILURES_SIZE 1024
 #define FP_IO_TIMEOUT_MS 30000
 #define FP_IDLE_TIMEOUT_MS 300000
 #define FP_MAX_CLIENTS 128
@@ -42,6 +50,65 @@ struct fp_status {
     char proxy[INET_ADDRSTRLEN + 7];
 };
 
+enum fp_test_mode {
+    FP_TEST_MODE_CONNECTIVITY,
+    FP_TEST_MODE_LATENCY,
+    FP_TEST_MODE_SPEED,
+};
+
+enum fp_test_phase {
+    FP_TEST_PHASE_PREFLIGHT,
+    FP_TEST_PHASE_CONNECTIVITY,
+    FP_TEST_PHASE_LATENCY,
+    FP_TEST_PHASE_SPEED,
+    FP_TEST_PHASE_DONE,
+};
+
+enum fp_test_site_state {
+    FP_TEST_SITE_PENDING,
+    FP_TEST_SITE_RUNNING,
+    FP_TEST_SITE_OK,
+    FP_TEST_SITE_FAIL,
+    FP_TEST_SITE_CANCELLED,
+};
+
+struct fp_test_site_result {
+    char name[32];
+    char domain[64];
+    enum fp_test_site_state state;
+    int latency_ms;
+    double speed_mbps;
+    size_t bytes_downloaded;
+};
+
+struct fp_test_report {
+    enum fp_test_mode mode;
+    bool listener_ok;
+    bool cancelled;
+    struct fp_test_site_result sites[FP_TEST_MAX_SITES];
+    size_t site_count;
+    size_t sites_passed;
+    struct fp_test_site_result speed[FP_TEST_MAX_SPEED];
+    size_t speed_count;
+    size_t speed_passed;
+    double best_speed_mbps;
+    char failures[FP_TEST_FAILURES_SIZE];
+};
+
+struct fp_test_progress_event {
+    enum fp_test_phase phase;
+    size_t index;
+    size_t total;
+    enum fp_test_site_state state;
+    int latency_ms;
+    double speed_mbps;
+    size_t bytes_downloaded;
+    char name[32];
+    char domain[64];
+};
+
+typedef void (*fp_test_event_callback)(const struct fp_test_progress_event *event, void *context);
+
 int fp_parse_proxy(const char *value, struct fp_config *config);
 int fp_config_load(struct fp_config *config);
 int fp_config_save(const struct fp_config *config);
@@ -64,7 +131,10 @@ bool fp_daemon_matches_config(const struct fp_config *config);
 
 int fp_proxy_run(const struct fp_config *config, int ready_fd);
 int fp_socks5_drain_bind(int socket_fd);
-int fp_test_proxy(void);
+
+int fp_test_run(enum fp_test_mode mode, struct fp_test_report *report,
+                fp_test_event_callback on_event, void *context,
+                volatile sig_atomic_t *cancel_flag);
 
 int fp_autostart_enable(void);
 int fp_autostart_disable(void);

@@ -67,13 +67,15 @@ Run `sudo free_proxy` at any time to open the controller.
 | `e` | Change the SOCKS5 `IPv4:PORT` and enable it |
 | `d` | Disable the active proxy |
 | `a` | Enable or disable start at boot |
-| `t` | Test the SOCKS5 connection |
+| `t` | Open the network test page (choose connectivity, latency, or speed) |
 | `u` | Uninstall after typing the exact confirmation `yes` |
 | `l` | Switch the controller between English and Chinese |
 | `r` | Refresh status |
 | `q` | Exit the controller |
 
 The proxy input accepts the main keyboard and numeric keypad. In the input field, press `q` or `Esc` to cancel without changing the configuration.
+
+Press `t` to open the network test page, then choose `1` connectivity, `2` latency, or `3` download speed. Connectivity and latency check 25 common international sites through SOCKS5. Speed downloads up to 10 MiB and shows live Mbps while running. Press `q` to cancel a running test or leave the menu. The result screen shows pass counts and failed targets.
 
 ## Command-line usage
 
