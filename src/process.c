@@ -394,6 +394,7 @@ int fp_start_daemon(const struct fp_config *config) {
         return -1;
     }
     fp_remove_pid();
+    fp_stats_unlink();
     executable_length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
     if (executable_length < 0 || pipe2(ready_pipe, O_CLOEXEC) != 0) {
         return -1;
@@ -460,5 +461,6 @@ int fp_stop_daemon(void) {
         }
     }
     fp_remove_pid();
+    fp_stats_unlink();
     return 0;
 }

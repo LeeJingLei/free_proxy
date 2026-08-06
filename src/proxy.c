@@ -7,6 +7,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/prctl.h>
@@ -26,9 +27,11 @@ static void stop_proxy(int signal_number) {
 
 static void reap_clients(int signal_number) {
     int saved_errno = errno;
+    pid_t child;
 
     (void)signal_number;
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    while ((child = waitpid(-1, NULL, WNOHANG)) > 0) {
+        fp_stats_clear_pid(child);
         if (active_clients > 0) {
             --active_clients;
         }
@@ -161,7 +164,7 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
     return socket_fd;
 }
 
-static void relay(int client_fd, int upstream_fd) {
+static void relay(int client_fd, int upstream_fd, int stats_slot) {
     struct pollfd descriptors[2] = {
         {.fd = client_fd, .events = POLLIN},
         {.fd = upstream_fd, .events = POLLIN},
@@ -194,6 +197,11 @@ static void relay(int client_fd, int upstream_fd) {
             if (write_all(target, buffer, (size_t)received) != 0) {
                 return;
             }
+            if (source == client_fd) {
+                fp_stats_add(stats_slot, (uint64_t)received, 0);
+            } else {
+                fp_stats_add(stats_slot, 0, (uint64_t)received);
+            }
         }
         if (descriptors[0].events == 0 && descriptors[1].events == 0) {
             return;
@@ -212,17 +220,25 @@ static void handle_client(int client_fd, const struct fp_config *config) {
     struct sockaddr_in destination;
     socklen_t destination_length = sizeof(destination);
     int upstream_fd;
+    int stats_slot = -1;
 
     if (set_socket_timeouts(client_fd, FP_IO_TIMEOUT_MS) != 0 ||
         getsockopt(client_fd, SOL_IP, SO_ORIGINAL_DST, &destination, &destination_length) != 0) {
         close(client_fd);
         return;
     }
+    stats_slot = fp_stats_claim(&destination);
+    if (drop_client_privileges() != 0) {
+        fp_stats_release(stats_slot);
+        close(client_fd);
+        return;
+    }
     upstream_fd = connect_socks(config, &destination, FP_CONNECT_TIMEOUT_MS, FP_IO_TIMEOUT_MS);
     if (upstream_fd >= 0) {
-        relay(client_fd, upstream_fd);
+        relay(client_fd, upstream_fd, stats_slot);
         close(upstream_fd);
     }
+    fp_stats_release(stats_slot);
     close(client_fd);
 }
 
@@ -266,8 +282,9 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
         signal_ready(ready_fd, 'E');
         return -1;
     }
-    if (fp_write_pid(config) != 0 || fp_firewall_enable(config) != 0) {
+    if (fp_stats_create() != 0 || fp_write_pid(config) != 0 || fp_firewall_enable(config) != 0) {
         close(listener);
+        fp_stats_close();
         (void)fp_firewall_disable();
         signal_ready(ready_fd, 'E');
         return -1;
@@ -289,6 +306,7 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
             }
             close(listener);
             fp_remove_pid();
+            fp_stats_close();
             return -1;
         }
         client_fd = accept(listener, NULL, NULL);
@@ -298,6 +316,7 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
             }
             close(listener);
             fp_remove_pid();
+            fp_stats_close();
             return -1;
         }
         if (active_clients >= FP_MAX_CLIENTS) {
@@ -315,11 +334,11 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
             (void)signal(SIGTERM, SIG_DFL);
             (void)signal(SIGINT, SIG_DFL);
             (void)sigprocmask(SIG_SETMASK, &previous_signal_mask, NULL);
-            if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent_pid ||
-                drop_client_privileges() != 0) {
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent_pid) {
                 close(client_fd);
                 _exit(1);
             }
+            /* Claim stats while still root-capable for mapping; then drop privileges. */
             handle_client(client_fd, config);
             _exit(0);
         }
@@ -331,5 +350,6 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
     }
     close(listener);
     fp_remove_pid();
+    fp_stats_close();
     return 0;
 }

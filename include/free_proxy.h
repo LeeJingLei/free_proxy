@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #define FP_CONFIG_DIR "/etc/free_proxy"
@@ -13,6 +14,7 @@
 #define FP_RUNTIME_DIR "/run/free_proxy"
 #define FP_PID_PATH FP_RUNTIME_DIR "/free_proxy.pid"
 #define FP_LOCK_PATH FP_RUNTIME_DIR "/lock"
+#define FP_STATS_PATH FP_RUNTIME_DIR "/stats"
 #define FP_CHAIN "FPROXY_OUT"
 #define FP_LISTEN_PORT 12345
 #define FP_START_TIMEOUT_MS 5000
@@ -131,6 +133,36 @@ bool fp_daemon_matches_config(const struct fp_config *config);
 
 int fp_proxy_run(const struct fp_config *config, int ready_fd);
 int fp_socks5_drain_bind(int socket_fd);
+
+struct fp_stats_conn_view {
+    struct in_addr dest_addr;
+    unsigned short dest_port;
+    pid_t pid;
+    uint64_t bytes_up;
+    uint64_t bytes_down;
+    uint64_t age_ms;
+};
+
+struct fp_stats_snapshot {
+    bool available;
+    uint64_t started_ms;
+    uint64_t uptime_ms;
+    uint64_t total_up;
+    uint64_t total_down;
+    size_t conn_count;
+    struct fp_stats_conn_view connections[FP_MAX_CLIENTS];
+};
+
+int fp_stats_create(void);
+int fp_stats_open_readonly(void);
+void fp_stats_reopen_readonly(void);
+void fp_stats_close(void);
+void fp_stats_unlink(void);
+int fp_stats_claim(const struct sockaddr_in *destination);
+void fp_stats_add(int slot_index, uint64_t bytes_up, uint64_t bytes_down);
+void fp_stats_release(int slot_index);
+void fp_stats_clear_pid(pid_t pid);
+int fp_stats_snapshot(struct fp_stats_snapshot *snapshot);
 
 int fp_test_run(enum fp_test_mode mode, struct fp_test_report *report,
                 fp_test_event_callback on_event, void *context,

@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,77 +130,44 @@ static int write_all(int file_descriptor, const void *buffer, size_t length) {
     return 0;
 }
 
-static int read_all(int file_descriptor, void *buffer, size_t length) {
-    unsigned char *cursor = buffer;
+/*
+ * Connect to an IPv4 target through the transparent forwarder path (iptables REDIRECT).
+ * This exercises free_proxy itself and produces monitor traffic, unlike talking to SOCKS5
+ * directly (which is excluded from REDIRECT).
+ */
+static int connect_through_forwarder(const char *host, unsigned short port, int connect_timeout_ms,
+                                     int io_timeout_ms) {
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+    struct addrinfo *entry;
+    char port_text[8];
+    int socket_fd = -1;
+    int status;
 
-    while (length > 0) {
-        ssize_t received = recv(file_descriptor, cursor, length, 0);
-        if (received < 0 && errno == EINTR) {
+    if (snprintf(port_text, sizeof(port_text), "%u", port) < 0) {
+        return -1;
+    }
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    status = getaddrinfo(host, port_text, &hints, &result);
+    if (status != 0 || result == NULL) {
+        return -1;
+    }
+    for (entry = result; entry != NULL; entry = entry->ai_next) {
+        socket_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        if (socket_fd < 0) {
             continue;
         }
-        if (received <= 0) {
-            return -1;
+        if (connect_with_timeout(socket_fd, entry->ai_addr, entry->ai_addrlen, connect_timeout_ms) ==
+                0 &&
+            set_socket_timeouts(socket_fd, io_timeout_ms) == 0) {
+            break;
         }
-        cursor += received;
-        length -= (size_t)received;
-    }
-    return 0;
-}
-
-static int open_socks(const struct fp_config *config, int connect_timeout_ms, int io_timeout_ms) {
-    int socket_fd;
-    unsigned char greeting[] = {0x05, 0x01, 0x00};
-    unsigned char response[2];
-    struct sockaddr_in proxy = {
-        .sin_family = AF_INET,
-        .sin_addr = config->proxy_addr,
-        .sin_port = htons(config->proxy_port),
-    };
-
-    socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd < 0 ||
-        connect_with_timeout(socket_fd, (struct sockaddr *)&proxy, sizeof(proxy),
-                             connect_timeout_ms) != 0 ||
-        set_socket_timeouts(socket_fd, io_timeout_ms) != 0 ||
-        write_all(socket_fd, greeting, sizeof(greeting)) != 0 ||
-        read_all(socket_fd, response, sizeof(response)) != 0 || response[0] != 0x05 ||
-        response[1] != 0x00) {
-        if (socket_fd >= 0) {
-            close(socket_fd);
-        }
-        return -1;
-    }
-    return socket_fd;
-}
-
-static int connect_socks_domain(const struct fp_config *config, const char *domain,
-                                unsigned short port, int connect_timeout_ms, int io_timeout_ms) {
-    unsigned char request_header[] = {0x05, 0x01, 0x00, 0x03};
-    unsigned char domain_length;
-    unsigned char port_bytes[2];
-    unsigned char response[2];
-    size_t length = strlen(domain);
-    int socket_fd;
-
-    if (length == 0 || length > 255) {
-        return -1;
-    }
-    socket_fd = open_socks(config, connect_timeout_ms, io_timeout_ms);
-    if (socket_fd < 0) {
-        return -1;
-    }
-    domain_length = (unsigned char)length;
-    port_bytes[0] = (unsigned char)(port >> 8);
-    port_bytes[1] = (unsigned char)(port & 0xff);
-    if (write_all(socket_fd, request_header, sizeof(request_header)) != 0 ||
-        write_all(socket_fd, &domain_length, 1) != 0 ||
-        write_all(socket_fd, domain, length) != 0 ||
-        write_all(socket_fd, port_bytes, sizeof(port_bytes)) != 0 ||
-        read_all(socket_fd, response, sizeof(response)) != 0 || response[0] != 0x05 ||
-        response[1] != 0x00 || fp_socks5_drain_bind(socket_fd) != 0) {
         close(socket_fd);
-        return -1;
+        socket_fd = -1;
     }
+    freeaddrinfo(result);
     return socket_fd;
 }
 
@@ -253,6 +221,7 @@ static int measure_latency(const struct fp_config *config, const char *domain, u
     long long end;
     int socket_fd;
 
+    (void)config;
     if (cancelled(cancel_flag)) {
         return -2;
     }
@@ -260,7 +229,8 @@ static int measure_latency(const struct fp_config *config, const char *domain, u
     if (start < 0) {
         return -1;
     }
-    socket_fd = connect_socks_domain(config, domain, port, FP_TEST_TIMEOUT_MS, FP_TEST_TIMEOUT_MS);
+    socket_fd =
+        connect_through_forwarder(domain, port, FP_TEST_TIMEOUT_MS, FP_TEST_TIMEOUT_MS);
     end = now_ms();
     if (socket_fd < 0 || end < 0) {
         return cancelled(cancel_flag) ? -2 : -1;
@@ -323,11 +293,12 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
 
     *bytes_downloaded = 0;
     *speed_mbps = 0.0;
+    (void)config;
     if (cancelled(cancel_flag)) {
         return -2;
     }
-    socket_fd = connect_socks_domain(config, target->host, target->port, FP_TEST_SPEED_CONNECT_MS,
-                                     FP_TEST_SPEED_STALL_MS);
+    socket_fd = connect_through_forwarder(target->host, target->port, FP_TEST_SPEED_CONNECT_MS,
+                                          FP_TEST_SPEED_STALL_MS);
     if (socket_fd < 0) {
         return cancelled(cancel_flag) ? -2 : -1;
     }

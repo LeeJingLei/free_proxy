@@ -1,5 +1,6 @@
 #include "free_proxy.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <locale.h>
 #include <ncursesw/ncurses.h>
@@ -7,9 +8,10 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
-#define MIN_ROWS 22
+#define MIN_ROWS 24
 #define MIN_COLS 66
 
 struct ui_text {
@@ -31,6 +33,7 @@ struct ui_text {
     const char *enable;
     const char *disable;
     const char *startup;
+    const char *monitor;
     const char *test;
     const char *uninstall;
     const char *language;
@@ -66,6 +69,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  修改 IPv4:端口 并启用代理",
          "d  停用代理",
          "a  切换开机自启",
+         "m  流量与连接监控",
          "t  打开网络测试页",
          "u  卸载 free_proxy",
          "l  切换语言（中文/English）",
@@ -98,6 +102,7 @@ static const struct ui_text UI_TEXT[] = {
          "e  Change IPv4:PORT and enable proxy",
          "d  Disable proxy",
          "a  Toggle boot startup",
+         "m  Traffic and connection monitor",
          "t  Open network test page",
          "u  Uninstall free_proxy",
          "l  Switch language (中文/English)",
@@ -169,12 +174,13 @@ static void draw_screen(const struct fp_status *status, const struct ui_text *te
     mvprintw(11, 4, "%s", text->enable);
     mvprintw(12, 4, "%s", text->disable);
     mvprintw(13, 4, "%s", text->startup);
-    mvprintw(14, 4, "%s", text->test);
-    mvprintw(15, 4, "%s", text->uninstall);
-    mvprintw(16, 4, "%s", text->language);
-    mvprintw(17, 4, "%s", text->refresh);
-    mvprintw(18, 4, "%s", text->quit);
-    mvprintw(19, 4, "%s", text->coverage);
+    mvprintw(14, 4, "%s", text->monitor);
+    mvprintw(15, 4, "%s", text->test);
+    mvprintw(16, 4, "%s", text->uninstall);
+    mvprintw(17, 4, "%s", text->language);
+    mvprintw(18, 4, "%s", text->refresh);
+    mvprintw(19, 4, "%s", text->quit);
+    mvprintw(20, 4, "%s", text->coverage);
 
     if (message[0] != '\0') {
         attron(A_BOLD);
@@ -594,6 +600,364 @@ static void run_test_page(enum fp_ui_language language, char *message, size_t me
     timeout(1000);
 }
 
+static void format_bytes(char *buffer, size_t buffer_size, uint64_t bytes) {
+    if (bytes >= 1024ull * 1024ull * 1024ull) {
+        (void)snprintf(buffer, buffer_size, "%.2f GiB",
+                       (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    } else if (bytes >= 1024ull * 1024ull) {
+        (void)snprintf(buffer, buffer_size, "%.2f MiB", (double)bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ull) {
+        (void)snprintf(buffer, buffer_size, "%.1f KiB", (double)bytes / 1024.0);
+    } else {
+        (void)snprintf(buffer, buffer_size, "%llu B", (unsigned long long)bytes);
+    }
+}
+
+static void format_rate(char *buffer, size_t buffer_size, double mbps) {
+    if (mbps < 0.0) {
+        mbps = 0.0;
+    }
+    (void)snprintf(buffer, buffer_size, "%.2f Mbps", mbps);
+}
+
+static void format_duration(char *buffer, size_t buffer_size, uint64_t age_ms) {
+    uint64_t seconds = age_ms / 1000ull;
+    uint64_t minutes = seconds / 60ull;
+    uint64_t hours = minutes / 60ull;
+
+    if (hours > 0) {
+        (void)snprintf(buffer, buffer_size, "%lluh%02llum", (unsigned long long)hours,
+                       (unsigned long long)(minutes % 60ull));
+    } else if (minutes > 0) {
+        (void)snprintf(buffer, buffer_size, "%llum%02llus", (unsigned long long)minutes,
+                       (unsigned long long)(seconds % 60ull));
+    } else {
+        (void)snprintf(buffer, buffer_size, "%llus", (unsigned long long)seconds);
+    }
+}
+
+struct monitor_rate_state {
+    uint64_t anchor_up;
+    uint64_t anchor_down;
+    struct timespec anchor_time;
+    double up_mbps;
+    double down_mbps;
+    int has_anchor;
+};
+
+static double timespec_elapsed_ms(const struct timespec *start, const struct timespec *end) {
+    return (double)(end->tv_sec - start->tv_sec) * 1000.0 +
+           (double)(end->tv_nsec - start->tv_nsec) / 1000000.0;
+}
+
+/*
+ * Instant 50ms deltas flicker to 0 between TCP bursts. Display rate over a ~1s
+ * window so the value tracks throughput without jumping through zero.
+ */
+static void update_monitor_rates(struct monitor_rate_state *state, uint64_t total_up,
+                                 uint64_t total_down, const struct timespec *now) {
+    double elapsed_ms;
+
+    if (!state->has_anchor) {
+        state->anchor_up = total_up;
+        state->anchor_down = total_down;
+        state->anchor_time = *now;
+        state->up_mbps = 0.0;
+        state->down_mbps = 0.0;
+        state->has_anchor = 1;
+        return;
+    }
+
+    elapsed_ms = timespec_elapsed_ms(&state->anchor_time, now);
+    if (elapsed_ms < 200.0) {
+        return;
+    }
+
+    state->up_mbps = ((double)(total_up - state->anchor_up) * 8.0) / (elapsed_ms * 1000.0);
+    state->down_mbps = ((double)(total_down - state->anchor_down) * 8.0) / (elapsed_ms * 1000.0);
+
+    if (elapsed_ms >= 1000.0) {
+        state->anchor_up = total_up;
+        state->anchor_down = total_down;
+        state->anchor_time = *now;
+    }
+}
+
+static void draw_monitor_page(enum fp_ui_language language, const struct fp_stats_snapshot *snapshot,
+                              double up_mbps, double down_mbps, int daemon_running,
+                              const char *status_line, int testing) {
+    const char *title = language == FP_UI_LANGUAGE_ZH ? "流量与连接监控" : "Traffic monitor";
+    const char *hint = testing ?
+                           (language == FP_UI_LANGUAGE_ZH ? "测试中…  按 q 取消" :
+                                                           "Testing…  press q to cancel") :
+                           (language == FP_UI_LANGUAGE_ZH ?
+                                "1 连通性  2 延迟  3 测速  |  q 返回" :
+                                "1 connectivity  2 latency  3 speed  |  q back");
+    char up_rate[32];
+    char down_rate[32];
+    char total_up[32];
+    char total_down[32];
+    char uptime[32];
+    int row = 8;
+    int list_bottom = LINES - 3;
+    size_t index;
+    size_t shown = 0;
+
+    if (status_line != NULL && status_line[0] != '\0') {
+        list_bottom = LINES - 4;
+    }
+
+    format_rate(up_rate, sizeof(up_rate), up_mbps);
+    format_rate(down_rate, sizeof(down_rate), down_mbps);
+    format_bytes(total_up, sizeof(total_up), snapshot->available ? snapshot->total_up : 0);
+    format_bytes(total_down, sizeof(total_down), snapshot->available ? snapshot->total_down : 0);
+    format_duration(uptime, sizeof(uptime), snapshot->available ? snapshot->uptime_ms : 0);
+
+    erase();
+    attron(A_BOLD | A_UNDERLINE);
+    mvprintw(1, 4, "%s", title);
+    attroff(A_BOLD | A_UNDERLINE);
+    mvhline(2, 2, '-', COLS - 4);
+
+    if (!daemon_running || !snapshot->available) {
+        mvprintw(4, 4, "%s",
+                 language == FP_UI_LANGUAGE_ZH ?
+                     "转发服务未运行，暂无流量统计。" :
+                     "Forwarder is not running; no live stats.");
+    } else {
+        mvprintw(3, 4,
+                 language == FP_UI_LANGUAGE_ZH ?
+                     "实时   ↑  %s      ↓  %s" :
+                     "Live    ↑  %s      ↓  %s",
+                 up_rate, down_rate);
+        mvprintw(4, 4,
+                 language == FP_UI_LANGUAGE_ZH ?
+                     "累计   ↑  %s      ↓  %s      运行 %s" :
+                     "Total   ↑  %s      ↓  %s      up %s",
+                 total_up, total_down, uptime);
+        mvprintw(5, 4,
+                 language == FP_UI_LANGUAGE_ZH ? "活跃连接：%zu" : "Active connections: %zu",
+                 snapshot->conn_count);
+        mvhline(6, 2, '-', COLS - 4);
+        mvprintw(7, 4,
+                 language == FP_UI_LANGUAGE_ZH ?
+                     "目标                      ↑  流量      ↓  流量     时长" :
+                     "Destination               ↑  bytes     ↓  bytes    age");
+        for (index = 0; index < snapshot->conn_count && row < list_bottom; ++index) {
+            const struct fp_stats_conn_view *conn = &snapshot->connections[index];
+            char address[INET_ADDRSTRLEN];
+            char dest[32];
+            char up_bytes[24];
+            char down_bytes[24];
+            char age[16];
+
+            if (inet_ntop(AF_INET, &conn->dest_addr, address, sizeof(address)) == NULL) {
+                continue;
+            }
+            (void)snprintf(dest, sizeof(dest), "%s:%u", address, conn->dest_port);
+            format_bytes(up_bytes, sizeof(up_bytes), conn->bytes_up);
+            format_bytes(down_bytes, sizeof(down_bytes), conn->bytes_down);
+            format_duration(age, sizeof(age), conn->age_ms);
+            mvprintw(row++, 4, "%-24s %10s %10s %7s", dest, up_bytes, down_bytes, age);
+            ++shown;
+        }
+        if (shown == 0) {
+            mvprintw(row, 4, "%s",
+                     language == FP_UI_LANGUAGE_ZH ? "当前没有活跃连接。" :
+                                                     "No active connections.");
+        }
+    }
+
+    if (status_line != NULL && status_line[0] != '\0') {
+        attron(A_BOLD);
+        mvprintw(LINES - 3, 4, "%.*s", COLS - 8, status_line);
+        attroff(A_BOLD);
+    }
+    attron(A_BOLD);
+    mvprintw(LINES - 2, 4, "%s", hint);
+    attroff(A_BOLD);
+    refresh();
+}
+
+static void format_monitor_test_result(enum fp_ui_language language, enum fp_test_mode mode,
+                                       const struct fp_test_report *report, char *message,
+                                       size_t message_size) {
+    if (!report->listener_ok) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ?
+                           "测试失败：请确认服务、规则和宿主机 SOCKS5 可用。" :
+                           "Test failed: check the forwarder, rules, and host SOCKS5.");
+    } else if (report->cancelled) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "测试已取消。" : "Test cancelled.");
+    } else if (mode == FP_TEST_MODE_SPEED) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ?
+                           "测速结果：%zu/%zu，峰值 %.2f Mbps。" :
+                           "Speed result: %zu/%zu, peak %.2f Mbps.",
+                       report->speed_passed, report->speed_count, report->best_speed_mbps);
+    } else if (mode == FP_TEST_MODE_LATENCY) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "延迟结果：%zu/%zu 成功。" :
+                                                       "Latency result: %zu/%zu passed.",
+                       report->sites_passed, report->site_count);
+    } else {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "连通性结果：%zu/%zu 成功。" :
+                                                       "Connectivity result: %zu/%zu passed.",
+                       report->sites_passed, report->site_count);
+    }
+}
+
+static void run_monitor_test(enum fp_ui_language language, enum fp_test_mode mode,
+                             char *status_line, size_t status_size,
+                             struct monitor_rate_state *rates) {
+    struct fp_test_report report;
+    struct fp_test_progress_event event;
+    struct test_worker_args args;
+    struct fp_stats_snapshot snapshot;
+    struct fp_status status;
+    pthread_t worker;
+    volatile sig_atomic_t cancel_flag = 0;
+    int pipe_fds[2];
+    int cancelling = 0;
+    int finished = 0;
+
+    memset(&report, 0, sizeof(report));
+    memset(&event, 0, sizeof(event));
+    if (pipe(pipe_fds) != 0) {
+        (void)snprintf(status_line, status_size,
+                       language == FP_UI_LANGUAGE_ZH ? "无法启动测试。" : "Unable to start test.");
+        return;
+    }
+
+    args.mode = mode;
+    args.report = &report;
+    args.event_fd = pipe_fds[1];
+    args.cancel_flag = &cancel_flag;
+    if (pthread_create(&worker, NULL, test_worker_main, &args) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        (void)snprintf(status_line, status_size,
+                       language == FP_UI_LANGUAGE_ZH ? "无法启动测试。" : "Unable to start test.");
+        return;
+    }
+
+    (void)snprintf(status_line, status_size,
+                   language == FP_UI_LANGUAGE_ZH ? "正在测试…" : "Testing…");
+    nodelay(stdscr, TRUE);
+    while (!finished) {
+        struct pollfd descriptors[1] = {{.fd = pipe_fds[0], .events = POLLIN}};
+        struct timespec now;
+        int key = getch();
+        int poll_result;
+
+        if ((key == 'q' || key == 'Q') && !cancelling) {
+            cancel_flag = 1;
+            cancelling = 1;
+            (void)snprintf(status_line, status_size,
+                           language == FP_UI_LANGUAGE_ZH ? "正在取消测试…" : "Cancelling test…");
+        }
+
+        fp_collect_status(&status);
+        fp_stats_reopen_readonly();
+        memset(&snapshot, 0, sizeof(snapshot));
+        if (status.daemon_running) {
+            (void)fp_stats_snapshot(&snapshot);
+        }
+        (void)clock_gettime(CLOCK_MONOTONIC, &now);
+        if (snapshot.available) {
+            update_monitor_rates(rates, snapshot.total_up, snapshot.total_down, &now);
+        }
+
+        poll_result = poll(descriptors, 1, 50);
+        if (poll_result > 0 && (descriptors[0].revents & POLLIN) != 0) {
+            if (read_test_event(pipe_fds[0], &event) == 0) {
+                if (event.phase == FP_TEST_PHASE_DONE) {
+                    finished = 1;
+                } else if (event.phase == FP_TEST_PHASE_SPEED &&
+                           event.state == FP_TEST_SITE_RUNNING && event.speed_mbps > 0.0) {
+                    (void)snprintf(status_line, status_size,
+                                   language == FP_UI_LANGUAGE_ZH ?
+                                       "测速中 %zu/%zu：%s  %.2f Mbps" :
+                                       "Speed %zu/%zu: %s  %.2f Mbps",
+                                   event.index, event.total, event.name, event.speed_mbps);
+                } else if (event.name[0] != '\0' && event.phase != FP_TEST_PHASE_PREFLIGHT) {
+                    (void)snprintf(status_line, status_size,
+                                   language == FP_UI_LANGUAGE_ZH ? "测试中 %zu/%zu：%s" :
+                                                                   "Testing %zu/%zu: %s",
+                                   event.index, event.total, event.name);
+                }
+            } else {
+                finished = 1;
+            }
+        } else if (poll_result < 0 && errno != EINTR) {
+            finished = 1;
+        }
+
+        draw_monitor_page(language, &snapshot, rates->up_mbps, rates->down_mbps,
+                          status.daemon_running, status_line, 1);
+    }
+    nodelay(stdscr, FALSE);
+    (void)pthread_join(worker, NULL);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    format_monitor_test_result(language, mode, &report, status_line, status_size);
+}
+
+static void run_monitor_page(enum fp_ui_language language, char *message, size_t message_size) {
+    struct fp_stats_snapshot snapshot;
+    struct fp_status status;
+    struct monitor_rate_state rates;
+    char status_line[160] = "";
+
+    memset(&rates, 0, sizeof(rates));
+    timeout(500);
+    nodelay(stdscr, FALSE);
+    for (;;) {
+        int key;
+        struct timespec now;
+
+        fp_collect_status(&status);
+        fp_stats_reopen_readonly();
+        memset(&snapshot, 0, sizeof(snapshot));
+        if (status.daemon_running) {
+            (void)fp_stats_snapshot(&snapshot);
+        }
+        (void)clock_gettime(CLOCK_MONOTONIC, &now);
+        if (snapshot.available) {
+            update_monitor_rates(&rates, snapshot.total_up, snapshot.total_down, &now);
+        } else {
+            memset(&rates, 0, sizeof(rates));
+        }
+        draw_monitor_page(language, &snapshot, rates.up_mbps, rates.down_mbps, status.daemon_running,
+                          status_line, 0);
+
+        key = getch();
+        if (key == 'q' || key == 'Q') {
+            (void)snprintf(message, message_size,
+                           language == FP_UI_LANGUAGE_ZH ? "已返回主界面。" :
+                                                           "Returned to main screen.");
+            break;
+        }
+        if (key == '1') {
+            run_monitor_test(language, FP_TEST_MODE_CONNECTIVITY, status_line, sizeof(status_line),
+                             &rates);
+            timeout(500);
+        } else if (key == '2') {
+            run_monitor_test(language, FP_TEST_MODE_LATENCY, status_line, sizeof(status_line),
+                             &rates);
+            timeout(500);
+        } else if (key == '3') {
+            run_monitor_test(language, FP_TEST_MODE_SPEED, status_line, sizeof(status_line),
+                             &rates);
+            timeout(500);
+        }
+    }
+    fp_stats_close();
+    timeout(1000);
+}
+
 static int keypad_digit(int key) {
     switch (key) {
         case KEY_IC:
@@ -790,6 +1154,8 @@ int fp_tui_run(void) {
             } else {
                 (void)snprintf(message, sizeof(message), "%s", text->startup_failed);
             }
+        } else if (key == 'm' || key == 'M') {
+            run_monitor_page(language, message, sizeof(message));
         } else if (key == 't' || key == 'T') {
             run_test_page(language, message, sizeof(message));
         } else if (key == 'u' || key == 'U') {
