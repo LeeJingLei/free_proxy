@@ -92,24 +92,20 @@ int fp_uninstall(void) {
     int stop_result;
     int firewall_result;
     int service_result;
+    int binary_result = 0;
 
     if (lock_fd < 0) {
         return -1;
     }
+    /* Best-effort and continue: do not abort before firewall cleanup. */
     service_result = fp_autostart_remove();
-    if (service_result != 0) {
-        fp_lock_release(lock_fd);
-        return -1;
-    }
     stop_result = fp_stop_daemon();
-    if (stop_result != 0) {
-        fp_lock_release(lock_fd);
-        return -1;
-    }
     firewall_result = fp_firewall_disable();
+    if (stop_result != 0) {
+        stop_result = fp_stop_daemon();
+    }
     if (firewall_result != 0) {
-        fp_lock_release(lock_fd);
-        return -1;
+        firewall_result = fp_firewall_disable();
     }
     fp_remove_pid();
     (void)unlink(FP_CONFIG_PATH);
@@ -119,9 +115,11 @@ int fp_uninstall(void) {
     (void)rmdir(FP_RUNTIME_DIR);
     (void)rmdir(FP_CONFIG_DIR);
     if (unlink(FP_INSTALLED_BINARY) != 0 && access(FP_INSTALLED_BINARY, F_OK) == 0) {
-        return -1;
+        binary_result = -1;
     }
-    return stop_result == 0 && firewall_result == 0 && service_result == 0 ? 0 : -1;
+    return service_result == 0 && stop_result == 0 && firewall_result == 0 && binary_result == 0
+               ? 0
+               : -1;
 }
 
 void fp_collect_status(struct fp_status *status) {

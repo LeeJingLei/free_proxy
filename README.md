@@ -141,8 +141,9 @@ Check the host proxy dashboard or connection log to confirm that the request rea
 | Problem | What to check |
 | --- | --- |
 | Cannot connect after enabling | Confirm the host IP and port, then run the explicit SOCKS5 `curl` command from the quick start section. |
-| Controller shows `iptables disabled` | Run `sudo free_proxy`, press `s`, and confirm it changes to enabled. |
-| Cannot enable start at boot | Install with `sudo make install` and use `/usr/local/bin/free_proxy`, not only `build/free_proxy`. |
+| Controller shows `iptables disabled` | Run `sudo free_proxy`, press `s`, and confirm it changes to enabled. Install the `iptables` package if the command is missing. |
+| Cannot enable start at boot | Install with `sudo make install` on a systemd host and use `/usr/local/bin/free_proxy`, not only `build/free_proxy`. Autostart is skipped cleanly when systemd is unavailable. |
+| Disable or uninstall fails | Re-run `sudo free_proxy disable` or `sudo make uninstall`. Cleanup now tolerates path-mismatched or deleted binaries; if it still fails, check port `12345` and the `FPROXY_OUT` iptables chain. |
 | Proxy works for `apt` but `ping` fails | Expected: `ping` uses ICMP, which this TCP proxy does not handle. |
 
 ## Limitations

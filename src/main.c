@@ -57,7 +57,10 @@ int main(int argc, char *argv[]) {
             return 2;
         }
         if (fp_enable_proxy(argv[3]) != 0) {
-            fprintf(stderr, "could not enable proxy; expected a valid IPv4:PORT and iptables\n");
+            fprintf(stderr,
+                    "could not enable proxy; check IPv4:PORT, root privileges, iptables NAT, "
+                    "and that TCP port %d is free\n",
+                    FP_LISTEN_PORT);
             return 1;
         }
         printf("free_proxy enabled: TCP IPv4 traffic uses SOCKS5 %s\n", argv[3]);
@@ -65,7 +68,10 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "disable") == 0) {
         if (fp_disable_proxy() != 0) {
-            fprintf(stderr, "free_proxy cleanup was incomplete\n");
+            fprintf(stderr,
+                    "free_proxy cleanup was incomplete; check remaining free_proxy processes, "
+                    "port %d, and iptables chain %s\n",
+                    FP_LISTEN_PORT, FP_CHAIN);
             return 1;
         }
         puts("free_proxy disabled");
@@ -77,7 +83,10 @@ int main(int argc, char *argv[]) {
             return 2;
         }
         if (fp_uninstall() != 0) {
-            fprintf(stderr, "free_proxy uninstall was incomplete\n");
+            fprintf(stderr,
+                    "free_proxy uninstall was incomplete; try: sudo make uninstall\n"
+                    "Also check processes, port %d, and iptables chain %s\n",
+                    FP_LISTEN_PORT, FP_CHAIN);
             return 1;
         }
         puts("free_proxy uninstalled");

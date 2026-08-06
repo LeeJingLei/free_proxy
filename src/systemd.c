@@ -1,5 +1,6 @@
 #include "free_proxy.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -14,10 +15,18 @@ static void silence_terminal(void) {
     }
 }
 
+static int systemctl_available(void) {
+    return access("/bin/systemctl", X_OK) == 0 || access("/usr/bin/systemctl", X_OK) == 0;
+}
+
 static int run_systemctl(const char *action) {
-    pid_t pid = fork();
+    pid_t pid;
     int status;
 
+    if (!systemctl_available()) {
+        return -1;
+    }
+    pid = fork();
     if (pid < 0) {
         return -1;
     }
@@ -33,9 +42,13 @@ static int run_systemctl(const char *action) {
 }
 
 static int reload_systemd(void) {
-    pid_t pid = fork();
+    pid_t pid;
     int status;
 
+    if (!systemctl_available()) {
+        return -1;
+    }
+    pid = fork();
     if (pid < 0) {
         return -1;
     }
@@ -50,9 +63,13 @@ static int reload_systemd(void) {
 }
 
 int fp_autostart_is_enabled(void) {
-    pid_t pid = fork();
+    pid_t pid;
     int status;
 
+    if (!systemctl_available() || access(FP_UNIT_PATH, R_OK) != 0) {
+        return 0;
+    }
+    pid = fork();
     if (pid < 0) {
         return 0;
     }
@@ -69,6 +86,9 @@ int fp_autostart_enable(void) {
     if (!fp_config_exists()) {
         return -1;
     }
+    if (!systemctl_available()) {
+        return -1;
+    }
     if (access(FP_INSTALLED_BINARY, X_OK) != 0 || access(FP_UNIT_PATH, R_OK) != 0) {
         return -1;
     }
@@ -76,20 +96,26 @@ int fp_autostart_enable(void) {
 }
 
 int fp_autostart_disable(void) {
-    return run_systemctl("disable");
+    if (!systemctl_available() || access(FP_UNIT_PATH, R_OK) != 0) {
+        return 0;
+    }
+    if (run_systemctl("disable") == 0) {
+        return 0;
+    }
+    /* Already disabled or unit unknown is fine for cleanup compatibility. */
+    return fp_autostart_is_enabled() ? -1 : 0;
 }
 
 int fp_autostart_remove(void) {
-    int disable_result = run_systemctl("disable");
-    int stop_result = run_systemctl("stop");
-
-    if (unlink(FP_UNIT_PATH) != 0 && access(FP_UNIT_PATH, F_OK) == 0) {
+    if (systemctl_available()) {
+        (void)run_systemctl("disable");
+        (void)run_systemctl("stop");
+    }
+    if (unlink(FP_UNIT_PATH) != 0 && errno != ENOENT && access(FP_UNIT_PATH, F_OK) == 0) {
         return -1;
     }
-    if (reload_systemd() != 0) {
-        return -1;
+    if (systemctl_available()) {
+        (void)reload_systemd();
     }
-    (void)disable_result;
-    (void)stop_result;
     return 0;
 }

@@ -84,6 +84,44 @@ static int process_start_time(pid_t pid, unsigned long long *start_time) {
     return -1;
 }
 
+static int exe_is_free_proxy(const char *target) {
+    const char *binary_name = strrchr(target, '/');
+
+    if (binary_name == NULL) {
+        binary_name = target;
+    } else {
+        ++binary_name;
+    }
+    return strcmp(binary_name, "free_proxy") == 0 ||
+           strcmp(binary_name, "free_proxy (deleted)") == 0;
+}
+
+static int cmdline_is_run(pid_t pid) {
+    char command_path[64];
+    char command[256];
+    ssize_t command_length;
+    size_t first_argument_length;
+    int command_fd;
+
+    if (snprintf(command_path, sizeof(command_path), "/proc/%ld/cmdline", (long)pid) < 0) {
+        return 0;
+    }
+    command_fd = open(command_path, O_RDONLY);
+    if (command_fd < 0) {
+        return 0;
+    }
+    command_length = read(command_fd, command, sizeof(command) - 1);
+    close(command_fd);
+    if (command_length <= 0) {
+        return 0;
+    }
+    first_argument_length = strnlen(command, (size_t)command_length);
+    if (first_argument_length + 1 >= (size_t)command_length) {
+        return 0;
+    }
+    return strcmp(command + first_argument_length + 1, "run") == 0;
+}
+
 static int process_is_ours(pid_t pid, unsigned long long expected_start_time) {
     char process_path[64];
     char target[4096];
@@ -97,28 +135,35 @@ static int process_is_ours(pid_t pid, unsigned long long expected_start_time) {
         return 0;
     }
     target_length = readlink(process_path, target, sizeof(target) - 1);
-    self_length = readlink("/proc/self/exe", self, sizeof(self) - 1);
-    if (target_length < 0 || self_length < 0) {
+    if (target_length < 0) {
         return 0;
     }
     target[target_length] = '\0';
-    self[self_length] = '\0';
-    return strcmp(target, self) == 0;
+    if (!exe_is_free_proxy(target) || !cmdline_is_run(pid)) {
+        return 0;
+    }
+    self_length = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (self_length >= 0) {
+        self[self_length] = '\0';
+        if (strcmp(target, self) == 0) {
+            return 1;
+        }
+    }
+    /* Accept path-mismatched or deleted binaries that still look like our daemon. */
+    return 1;
 }
 
 static int is_legacy_daemon(pid_t pid) {
     char process_path[64];
+    char status_path[64];
     char target[4096];
-    char command_path[64];
-    char command[256];
+    char line[256];
     ssize_t target_length;
-    ssize_t command_length;
-    const char *binary_name;
-    size_t first_argument_length;
+    FILE *file;
+    pid_t ppid = 0;
 
-    if (getsid(pid) != pid || getpgid(pid) != pid ||
-        snprintf(process_path, sizeof(process_path), "/proc/%ld/exe", (long)pid) < 0 ||
-        snprintf(command_path, sizeof(command_path), "/proc/%ld/cmdline", (long)pid) < 0) {
+    if (snprintf(process_path, sizeof(process_path), "/proc/%ld/exe", (long)pid) < 0 ||
+        snprintf(status_path, sizeof(status_path), "/proc/%ld/status", (long)pid) < 0) {
         return 0;
     }
     target_length = readlink(process_path, target, sizeof(target) - 1);
@@ -126,29 +171,28 @@ static int is_legacy_daemon(pid_t pid) {
         return 0;
     }
     target[target_length] = '\0';
-    binary_name = strrchr(target, '/');
-    if (binary_name == NULL ||
-        (strcmp(binary_name + 1, "free_proxy") != 0 &&
-         strcmp(binary_name + 1, "free_proxy (deleted)") != 0)) {
+    if (!exe_is_free_proxy(target) || !cmdline_is_run(pid)) {
         return 0;
     }
-    {
-        int command_fd = open(command_path, O_RDONLY);
-
-        if (command_fd < 0) {
-            return 0;
+    /*
+     * Prefer session leaders (daemon started via setsid). Also accept PID 1 children
+     * so systemd-managed instances are found even when they are not session leaders.
+     * Client workers are neither session leaders nor direct children of init.
+     */
+    file = fopen(status_path, "r");
+    if (file == NULL) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (sscanf(line, "PPid: %d", &ppid) == 1) {
+            break;
         }
-        command_length = read(command_fd, command, sizeof(command) - 1);
-        close(command_fd);
     }
-    if (command_length <= 0) {
-        return 0;
+    fclose(file);
+    if (getsid(pid) == pid && getpgid(pid) == pid) {
+        return 1;
     }
-    first_argument_length = strnlen(command, (size_t)command_length);
-    if (first_argument_length + 1 >= (size_t)command_length) {
-        return 0;
-    }
-    return strcmp(command + first_argument_length + 1, "run") == 0;
+    return ppid == 1;
 }
 static int stop_process(pid_t pid, unsigned long long start_time) {
     struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000L};
@@ -243,6 +287,19 @@ static int listener_is_released(void) {
     return 0;
 }
 
+static int wait_listener_released(void) {
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000L};
+    int attempts;
+
+    for (attempts = 0; attempts < 50; ++attempts) {
+        if (listener_is_released() == 0) {
+            return 0;
+        }
+        nanosleep(&delay, NULL);
+    }
+    return -1;
+}
+
 pid_t fp_read_pid(void) {
     pid_t pid;
     unsigned long long start_time;
@@ -330,9 +387,10 @@ int fp_start_daemon(const struct fp_config *config) {
             running_config.proxy_addr.s_addr == config->proxy_addr.s_addr) {
             return 0;
         }
-        return -1;
-    }
-    if (stop_untracked_daemons() != 0) {
+        if (fp_stop_daemon() != 0) {
+            return -1;
+        }
+    } else if (stop_untracked_daemons() != 0) {
         return -1;
     }
     fp_remove_pid();
@@ -380,24 +438,26 @@ int fp_stop_daemon(void) {
     pid_t pid;
     unsigned long long start_time;
     struct fp_config config;
-    if (read_process_record(&pid, &start_time, &config) != 0) {
-        if (stop_untracked_daemons() != 0 || listener_is_released() != 0) {
+    unsigned long long actual_start_time;
+
+    if (read_process_record(&pid, &start_time, &config) == 0) {
+        if (process_start_time(pid, &actual_start_time) == 0 && actual_start_time == start_time) {
+            if (process_is_ours(pid, start_time)) {
+                if (stop_process(pid, start_time) != 0) {
+                    return -1;
+                }
+            }
+            /* Stale or foreign PID with recycled identity: fall through to scan/cleanup. */
+        }
+    }
+    if (stop_untracked_daemons() != 0) {
+        return -1;
+    }
+    if (wait_listener_released() != 0) {
+        /* Last resort: scan again in case a late restart grabbed the port. */
+        if (stop_untracked_daemons() != 0 || wait_listener_released() != 0) {
             return -1;
         }
-        fp_remove_pid();
-        return 0;
-    }
-    if (!process_is_ours(pid, start_time)) {
-        if (stop_untracked_daemons() != 0) {
-            return -1;
-        }
-        return -1;
-    }
-    if (stop_process(pid, start_time) != 0) {
-        return -1;
-    }
-    if (stop_untracked_daemons() != 0 || listener_is_released() != 0) {
-        return -1;
     }
     fp_remove_pid();
     return 0;

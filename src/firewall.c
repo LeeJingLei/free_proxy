@@ -6,6 +6,22 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static const char *iptables_binary(void) {
+    if (access("/usr/sbin/iptables", X_OK) == 0) {
+        return "/usr/sbin/iptables";
+    }
+    if (access("/sbin/iptables", X_OK) == 0) {
+        return "/sbin/iptables";
+    }
+    if (access("/usr/sbin/iptables-nft", X_OK) == 0) {
+        return "/usr/sbin/iptables-nft";
+    }
+    if (access("/sbin/iptables-nft", X_OK) == 0) {
+        return "/sbin/iptables-nft";
+    }
+    return "iptables";
+}
+
 static int run_iptables(char *const arguments[]) {
     pid_t pid = fork();
     int status;
@@ -14,11 +30,20 @@ static int run_iptables(char *const arguments[]) {
         return -1;
     }
     if (pid == 0) {
+        char *argv_copy[32];
+        size_t count = 0;
+
         if (freopen("/dev/null", "w", stdout) == NULL ||
             freopen("/dev/null", "w", stderr) == NULL) {
             _exit(127);
         }
-        execvp("iptables", arguments);
+        while (arguments[count] != NULL && count + 1 < sizeof(argv_copy) / sizeof(argv_copy[0])) {
+            argv_copy[count] = arguments[count];
+            ++count;
+        }
+        argv_copy[count] = NULL;
+        argv_copy[0] = (char *)iptables_binary();
+        execvp(argv_copy[0], argv_copy);
         _exit(127);
     }
     if (waitpid(pid, &status, 0) < 0) {

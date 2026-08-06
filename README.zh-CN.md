@@ -141,8 +141,9 @@ curl -4 https://api.ipify.org
 | 问题 | 检查方式 |
 | --- | --- |
 | 启用后无法联网 | 确认宿主机 IP 和端口，并先执行快速开始中的显式 SOCKS5 `curl` 测试。 |
-| 界面显示 `iptables 已禁用` | 执行 `sudo free_proxy`，按 `s` 后确认状态变为已启用。 |
-| 无法开启开机自启 | 先执行 `sudo make install`，之后使用 `/usr/local/bin/free_proxy`，不要只运行 `build/free_proxy`。 |
+| 界面显示 `iptables 已禁用` | 执行 `sudo free_proxy`，按 `s` 后确认状态变为已启用。若缺少 `iptables` 命令，请安装该软件包。 |
+| 无法开启开机自启 | 在 systemd 主机上先执行 `sudo make install`，并使用 `/usr/local/bin/free_proxy`，不要只运行 `build/free_proxy`。无 systemd 时会干净跳过开机自启。 |
+| 停用或卸载失败 | 再执行 `sudo free_proxy disable` 或 `sudo make uninstall`。现已兼容路径不一致或 `(deleted)` 二进制；若仍失败，检查 `12345` 端口和 `FPROXY_OUT` 规则。 |
 | `apt` 可用但 `ping` 失败 | 这是预期行为：`ping` 使用 ICMP，当前 TCP 代理无法处理。 |
 
 ## 限制
