@@ -912,8 +912,13 @@ static void run_monitor_page(enum fp_ui_language language, char *message, size_t
     char status_line[160] = "";
 
     memset(&rates, 0, sizeof(rates));
-    timeout(500);
-    nodelay(stdscr, FALSE);
+    /*
+     * Do not rely on timeout()+blocking getch() for idle refresh: on some terminals
+     * it never wakes until a key is pressed, so the page looks frozen until a test
+     * (which uses nodelay + poll) starts the update loop.
+     */
+    timeout(-1);
+    nodelay(stdscr, TRUE);
     for (;;) {
         int key;
         struct timespec now;
@@ -941,19 +946,25 @@ static void run_monitor_page(enum fp_ui_language language, char *message, size_t
             break;
         }
         if (key == '1') {
+            nodelay(stdscr, FALSE);
             run_monitor_test(language, FP_TEST_MODE_CONNECTIVITY, status_line, sizeof(status_line),
                              &rates);
-            timeout(500);
+            nodelay(stdscr, TRUE);
         } else if (key == '2') {
+            nodelay(stdscr, FALSE);
             run_monitor_test(language, FP_TEST_MODE_LATENCY, status_line, sizeof(status_line),
                              &rates);
-            timeout(500);
+            nodelay(stdscr, TRUE);
         } else if (key == '3') {
+            nodelay(stdscr, FALSE);
             run_monitor_test(language, FP_TEST_MODE_SPEED, status_line, sizeof(status_line),
                              &rates);
-            timeout(500);
+            nodelay(stdscr, TRUE);
+        } else {
+            napms(200);
         }
     }
+    nodelay(stdscr, FALSE);
     fp_stats_close();
     timeout(1000);
 }
