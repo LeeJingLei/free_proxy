@@ -351,13 +351,19 @@ static int listener_ready(void) {
     return 0;
 }
 
-static int measure_latency(const struct fp_config *config, const char *domain, unsigned short port,
-                           int *latency_ms, atomic_bool *cancel_flag) {
+static enum fp_diagnostic_reason diagnostic_socks_connect(
+    const struct fp_config *config, const struct sockaddr_in *destination,
+    int *error_code, int *detail_code, atomic_bool *cancel_flag);
+
+static int measure_socks_connect_once(const struct fp_config *config,
+                                      const struct sockaddr_in *destination,
+                                      int *latency_ms, atomic_bool *cancel_flag) {
+    enum fp_diagnostic_reason reason;
     long long start;
     long long end;
-    int socket_fd;
+    int error_code = 0;
+    int detail_code = 0;
 
-    (void)config;
     if (cancelled(cancel_flag)) {
         return -2;
     }
@@ -365,16 +371,83 @@ static int measure_latency(const struct fp_config *config, const char *domain, u
     if (start < 0) {
         return -1;
     }
-    socket_fd = connect_through_forwarder(domain, port, FP_TEST_TIMEOUT_MS, FP_TEST_TIMEOUT_MS,
-                                          cancel_flag);
+    reason = diagnostic_socks_connect(config, destination, &error_code, &detail_code,
+                                      cancel_flag);
     end = now_ms();
-    if (socket_fd < 0 || end < 0) {
+    if (reason != FP_DIAGNOSTIC_REASON_NONE || end < 0) {
         return cancelled(cancel_flag) ? -2 : -1;
     }
-    close(socket_fd);
     *latency_ms = (int)(end - start);
     if (*latency_ms < 0) {
         *latency_ms = 0;
+    }
+    return 0;
+}
+
+static int measure_latency(const struct fp_config *config, const char *domain, unsigned short port,
+                           size_t sample_total, int *latency_ms,
+                           atomic_bool *cancel_flag) {
+    enum { FP_LATENCY_SAMPLE_COUNT = 3 };
+    struct sockaddr_in destination;
+    struct addrinfo *addresses = NULL;
+    struct addrinfo *address;
+    int samples[FP_LATENCY_SAMPLE_COUNT];
+    char port_text[8];
+    size_t sample;
+    int result = -1;
+
+    if ((sample_total != 1 && sample_total != FP_LATENCY_SAMPLE_COUNT) ||
+        snprintf(port_text, sizeof(port_text), "%u", port) < 0) {
+        return -1;
+    }
+    result = resolve_ipv4(domain, port_text, &addresses, cancel_flag, NULL);
+    if (result != 0 || addresses == NULL) {
+        return cancelled(cancel_flag) ? -2 : -1;
+    }
+
+    result = -1;
+    for (address = addresses; address != NULL; address = address->ai_next) {
+        if (address->ai_addrlen < sizeof(destination)) {
+            continue;
+        }
+        memcpy(&destination, address->ai_addr, sizeof(destination));
+        result = measure_socks_connect_once(config, &destination, &samples[0], cancel_flag);
+        if (result == 0 || result == -2) {
+            break;
+        }
+    }
+    freeaddrinfo(addresses);
+    if (result != 0) {
+        return result;
+    }
+
+    for (sample = 1; sample < sample_total; ++sample) {
+        result = measure_socks_connect_once(config, &destination, &samples[sample], cancel_flag);
+        if (result != 0) {
+            return result;
+        }
+    }
+    if (sample_total == FP_LATENCY_SAMPLE_COUNT) {
+        int temporary;
+
+        if (samples[0] > samples[1]) {
+            temporary = samples[0];
+            samples[0] = samples[1];
+            samples[1] = temporary;
+        }
+        if (samples[1] > samples[2]) {
+            temporary = samples[1];
+            samples[1] = samples[2];
+            samples[2] = temporary;
+        }
+        if (samples[0] > samples[1]) {
+            temporary = samples[0];
+            samples[0] = samples[1];
+            samples[1] = temporary;
+        }
+        *latency_ms = samples[1];
+    } else {
+        *latency_ms = samples[0];
     }
     return 0;
 }
@@ -570,7 +643,9 @@ static int run_site_tests(enum fp_test_mode mode, struct fp_config *config,
         (void)snprintf(event.domain, sizeof(event.domain), "%s", report->sites[index].domain);
         emit_event(on_event, context, &event);
 
+        /* Connectivity needs one real CONNECT; latency uses the median of three CONNECTs. */
         result = measure_latency(config, SITE_TARGETS[index].domain, SITE_TARGETS[index].port,
+                                 mode == FP_TEST_MODE_LATENCY ? 3U : 1U,
                                  &latency_ms, cancel_flag);
         if (result == -2 || cancelled(cancel_flag)) {
             report->cancelled = true;

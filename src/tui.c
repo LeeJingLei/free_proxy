@@ -252,7 +252,7 @@ static void draw_test_menu(enum fp_ui_language language) {
     const char *connectivity =
         language == FP_UI_LANGUAGE_ZH ? "1  网页连通性" : "1  Site connectivity";
     const char *latency =
-        language == FP_UI_LANGUAGE_ZH ? "2  延迟测试" : "2  Latency test";
+        language == FP_UI_LANGUAGE_ZH ? "2  代理建连延迟" : "2  SOCKS5 connect latency";
     const char *speed =
         language == FP_UI_LANGUAGE_ZH ? "3  下载测速" : "3  Download speed";
     const char *back =
@@ -313,18 +313,18 @@ static void draw_test_progress(enum fp_ui_language language, enum fp_test_mode m
     } else if (event->phase == FP_TEST_PHASE_LATENCY) {
         if (event->state == FP_TEST_SITE_RUNNING) {
             (void)snprintf(line, sizeof(line),
-                           language == FP_UI_LANGUAGE_ZH ? "延迟 %zu/%zu：%s (%s)…" :
-                                                           "Latency %zu/%zu: %s (%s)…",
+                           language == FP_UI_LANGUAGE_ZH ? "代理延迟 %zu/%zu：%s (%s)…" :
+                                                           "SOCKS5 latency %zu/%zu: %s (%s)…",
                            event->index, event->total, event->name, event->domain);
         } else if (event->state == FP_TEST_SITE_OK) {
             (void)snprintf(line, sizeof(line),
-                           language == FP_UI_LANGUAGE_ZH ? "延迟 %zu/%zu：%s  %d ms" :
-                                                           "Latency %zu/%zu: %s  %d ms",
+                           language == FP_UI_LANGUAGE_ZH ? "代理延迟 %zu/%zu：%s  %d ms" :
+                                                           "SOCKS5 latency %zu/%zu: %s  %d ms",
                            event->index, event->total, event->name, event->latency_ms);
         } else {
             (void)snprintf(line, sizeof(line),
-                           language == FP_UI_LANGUAGE_ZH ? "延迟 %zu/%zu：%s  失败" :
-                                                           "Latency %zu/%zu: %s  failed",
+                           language == FP_UI_LANGUAGE_ZH ? "代理延迟 %zu/%zu：%s  失败" :
+                                                           "SOCKS5 latency %zu/%zu: %s  failed",
                            event->index, event->total, event->name);
         }
     } else if (event->phase == FP_TEST_PHASE_SPEED) {
@@ -418,14 +418,14 @@ static void draw_test_results(enum fp_ui_language language, const struct fp_test
             if (latency_count > 0) {
                 mvprintw(row++, 4,
                          language == FP_UI_LANGUAGE_ZH ?
-                             "延迟：%zu/%zu 成功，平均 %d ms" :
-                             "Latency: %zu/%zu passed, avg %d ms",
+                             "代理建连延迟：%zu/%zu 成功，平均 %d ms" :
+                             "SOCKS5 connect latency: %zu/%zu passed, avg %d ms",
                          report->sites_passed, report->site_count,
                          latency_sum / (int)latency_count);
             } else {
                 mvprintw(row++, 4,
-                         language == FP_UI_LANGUAGE_ZH ? "延迟：%zu/%zu 成功" :
-                                                         "Latency: %zu/%zu passed",
+                         language == FP_UI_LANGUAGE_ZH ? "代理建连延迟：%zu/%zu 成功" :
+                                                         "SOCKS5 connect latency: %zu/%zu passed",
                          report->sites_passed, report->site_count);
             }
             for (index = 0; index < report->site_count && row < LINES - 5; ++index) {
@@ -571,8 +571,8 @@ static void run_selected_test(enum fp_ui_language language, enum fp_test_mode mo
                        report.speed_passed, report.speed_count, report.best_speed_mbps);
     } else if (mode == FP_TEST_MODE_LATENCY) {
         (void)snprintf(message, message_size,
-                       language == FP_UI_LANGUAGE_ZH ? "延迟测试完成：%zu/%zu。" :
-                                                       "Latency test done: %zu/%zu.",
+                       language == FP_UI_LANGUAGE_ZH ? "代理建连延迟测试完成：%zu/%zu。" :
+                                                       "SOCKS5 latency test done: %zu/%zu.",
                        report.sites_passed, report.site_count);
     } else {
         (void)snprintf(message, message_size,
@@ -1047,8 +1047,8 @@ static void draw_monitor_page(enum fp_ui_language language, const struct fp_stat
                            (language == FP_UI_LANGUAGE_ZH ? "测试中…  按 q 取消" :
                                                            "Testing…  press q to cancel") :
                            (language == FP_UI_LANGUAGE_ZH ?
-                                "1 连通性  2 延迟  3 测速  |  q 返回" :
-                                "1 connectivity  2 latency  3 speed  |  q back");
+                                "1 连通性  2 代理延迟  3 测速  |  q 返回" :
+                                "1 connectivity  2 SOCKS5 latency  3 speed  |  q back");
     char up_rate[32];
     char down_rate[32];
     char total_up[32];
@@ -1154,8 +1154,8 @@ static void format_monitor_test_result(enum fp_ui_language language, enum fp_tes
                        report->speed_passed, report->speed_count, report->best_speed_mbps);
     } else if (mode == FP_TEST_MODE_LATENCY) {
         (void)snprintf(message, message_size,
-                       language == FP_UI_LANGUAGE_ZH ? "延迟结果：%zu/%zu 成功。" :
-                                                       "Latency result: %zu/%zu passed.",
+                       language == FP_UI_LANGUAGE_ZH ? "代理延迟结果：%zu/%zu 成功。" :
+                                                       "SOCKS5 latency result: %zu/%zu passed.",
                        report->sites_passed, report->site_count);
     } else {
         (void)snprintf(message, message_size,

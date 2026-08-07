@@ -81,7 +81,7 @@ Press `m` to open the traffic monitor. While the forwarder is running it shows l
 
 Press `c` to run a read-only connection diagnosis. It stops at the first failed stage and reports whether the problem is the saved configuration, forwarder, local listener, iptables rules, proxy TCP port, SOCKS5 protocol/authentication, local DNS, proxy outbound connection, or transparent forwarding path.
 
-Press `t` to open the network test page, then choose `1` connectivity, `2` latency, or `3` download speed. Connectivity and latency check 25 common international sites through SOCKS5. Speed downloads up to 10 MiB and shows live Mbps while running. Press `q` to cancel a running test or leave the menu. The result screen shows pass counts and failed targets.
+Press `t` to open the network test page, then choose `1` connectivity, `2` SOCKS5 connect latency, or `3` download speed. Connectivity completes one real SOCKS5 CONNECT. Latency excludes local DNS and reports the median of three full proxy TCP, SOCKS5 handshake, and target CONNECT attempts per site. Speed downloads up to 10 MiB and shows live Mbps while running. Press `q` to cancel a running test or leave the menu.
 
 ## Command-line usage
 
