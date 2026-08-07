@@ -78,10 +78,6 @@ int fp_disable_proxy(void) {
         return -1;
     }
     daemon_result = fp_stop_daemon();
-    if (daemon_result != 0) {
-        fp_lock_release(lock_fd);
-        return -1;
-    }
     firewall_result = fp_firewall_disable();
     fp_lock_release(lock_fd);
     return firewall_result == 0 && daemon_result == 0 ? 0 : -1;

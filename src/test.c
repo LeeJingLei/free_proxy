@@ -5,11 +5,13 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 struct test_target {
@@ -59,17 +61,142 @@ static const struct speed_target SPEED_TARGETS[] = {
     {"CacheFly 10MB", "cachefly.cachefly.net", 80, "/10mb.test"},
 };
 
-static int cancelled(volatile sig_atomic_t *cancel_flag) {
-    return cancel_flag != NULL && *cancel_flag != 0;
+struct resolver_job {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    struct addrinfo hints;
+    struct addrinfo *result;
+    char host[256];
+    char service[8];
+    int status;
+    int done;
+    int abandoned;
+};
+
+static int cancelled(atomic_bool *cancel_flag) {
+    return cancel_flag != NULL && atomic_load_explicit(cancel_flag, memory_order_acquire);
+}
+
+static void destroy_resolver_job(struct resolver_job *job) {
+    (void)pthread_cond_destroy(&job->condition);
+    (void)pthread_mutex_destroy(&job->mutex);
+    free(job);
+}
+
+static void *resolver_main(void *context) {
+    struct resolver_job *job = context;
+    struct addrinfo *result = NULL;
+    int status = getaddrinfo(job->host, job->service, &job->hints, &result);
+
+    (void)pthread_mutex_lock(&job->mutex);
+    if (job->abandoned) {
+        (void)pthread_mutex_unlock(&job->mutex);
+        if (result != NULL) {
+            freeaddrinfo(result);
+        }
+        destroy_resolver_job(job);
+        return NULL;
+    }
+    job->result = result;
+    job->status = status;
+    job->done = 1;
+    (void)pthread_cond_signal(&job->condition);
+    (void)pthread_mutex_unlock(&job->mutex);
+    return NULL;
+}
+
+static int resolve_ipv4(const char *host, const char *service, struct addrinfo **result,
+                        atomic_bool *cancel_flag, int *resolver_error) {
+    struct resolver_job *job;
+    pthread_t resolver;
+    int wait_error = 0;
+    int status;
+
+    if (resolver_error != NULL) {
+        *resolver_error = 0;
+    }
+    if (cancelled(cancel_flag)) {
+        return -2;
+    }
+    job = calloc(1, sizeof(*job));
+    if (job == NULL) {
+        return -1;
+    }
+    if (strlen(host) >= sizeof(job->host) || strlen(service) >= sizeof(job->service)) {
+        free(job);
+        return -1;
+    }
+    (void)snprintf(job->host, sizeof(job->host), "%s", host);
+    (void)snprintf(job->service, sizeof(job->service), "%s", service);
+    if (pthread_mutex_init(&job->mutex, NULL) != 0) {
+        free(job);
+        return -1;
+    }
+    if (pthread_cond_init(&job->condition, NULL) != 0) {
+        (void)pthread_mutex_destroy(&job->mutex);
+        free(job);
+        return -1;
+    }
+    job->hints.ai_family = AF_INET;
+    job->hints.ai_socktype = SOCK_STREAM;
+    if (pthread_create(&resolver, NULL, resolver_main, job) != 0) {
+        destroy_resolver_job(job);
+        return -1;
+    }
+
+    (void)pthread_mutex_lock(&job->mutex);
+    while (!job->done && !cancelled(cancel_flag) && wait_error == 0) {
+        struct timespec deadline;
+
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            wait_error = -1;
+            break;
+        }
+        deadline.tv_nsec += 100000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            ++deadline.tv_sec;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        status = pthread_cond_timedwait(&job->condition, &job->mutex, &deadline);
+        if (status != 0 && status != ETIMEDOUT) {
+            wait_error = -1;
+        }
+    }
+    if (!job->done) {
+        job->abandoned = 1;
+        (void)pthread_mutex_unlock(&job->mutex);
+        (void)pthread_detach(resolver);
+        return cancelled(cancel_flag) ? -2 : -1;
+    }
+    status = job->status;
+    *result = job->result;
+    if (resolver_error != NULL) {
+        *resolver_error = status;
+    }
+    (void)pthread_mutex_unlock(&job->mutex);
+    (void)pthread_join(resolver, NULL);
+    destroy_resolver_job(job);
+    if (cancelled(cancel_flag)) {
+        if (*result != NULL) {
+            freeaddrinfo(*result);
+            *result = NULL;
+        }
+        return -2;
+    }
+    if (status != 0 && *result != NULL) {
+        freeaddrinfo(*result);
+        *result = NULL;
+    }
+    return status == 0 && *result != NULL ? 0 : -1;
 }
 
 static long long now_ms(void) {
-    struct timeval value;
+    struct timespec value;
 
-    if (gettimeofday(&value, NULL) != 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
         return -1;
     }
-    return (long long)value.tv_sec * 1000LL + (long long)value.tv_usec / 1000LL;
+    return (long long)value.tv_sec * 1000LL + (long long)value.tv_nsec / 1000000LL;
 }
 
 static int set_socket_timeouts(int file_descriptor, int timeout_ms) {
@@ -98,13 +225,21 @@ static int connect_with_timeout(int file_descriptor, const struct sockaddr *addr
     result = connect(file_descriptor, address, address_length);
     if (result != 0 && errno == EINPROGRESS) {
         result = poll(&descriptor, 1, timeout_ms);
-        if (result > 0 &&
-            getsockopt(file_descriptor, SOL_SOCKET, SO_ERROR, &socket_error,
-                       &socket_error_length) == 0 &&
-            socket_error == 0) {
-            result = 0;
-        } else {
+        if (result == 0) {
+            errno = ETIMEDOUT;
             result = -1;
+        } else if (result > 0) {
+            if (getsockopt(file_descriptor, SOL_SOCKET, SO_ERROR, &socket_error,
+                           &socket_error_length) == 0) {
+                if (socket_error == 0) {
+                    result = 0;
+                } else {
+                    errno = socket_error;
+                    result = -1;
+                }
+            } else {
+                result = -1;
+            }
         }
     }
     if (fcntl(file_descriptor, F_SETFL, original_flags) != 0) {
@@ -136,8 +271,7 @@ static int write_all(int file_descriptor, const void *buffer, size_t length) {
  * directly (which is excluded from REDIRECT).
  */
 static int connect_through_forwarder(const char *host, unsigned short port, int connect_timeout_ms,
-                                     int io_timeout_ms) {
-    struct addrinfo hints;
+                                     int io_timeout_ms, atomic_bool *cancel_flag) {
     struct addrinfo *result = NULL;
     struct addrinfo *entry;
     char port_text[8];
@@ -147,10 +281,7 @@ static int connect_through_forwarder(const char *host, unsigned short port, int 
     if (snprintf(port_text, sizeof(port_text), "%u", port) < 0) {
         return -1;
     }
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    status = getaddrinfo(host, port_text, &hints, &result);
+    status = resolve_ipv4(host, port_text, &result, cancel_flag, NULL);
     if (status != 0 || result == NULL) {
         return -1;
     }
@@ -158,6 +289,11 @@ static int connect_through_forwarder(const char *host, unsigned short port, int 
         socket_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (socket_fd < 0) {
             continue;
+        }
+        if (cancelled(cancel_flag)) {
+            close(socket_fd);
+            socket_fd = -1;
+            break;
         }
         if (connect_with_timeout(socket_fd, entry->ai_addr, entry->ai_addrlen, connect_timeout_ms) ==
                 0 &&
@@ -216,7 +352,7 @@ static int listener_ready(void) {
 }
 
 static int measure_latency(const struct fp_config *config, const char *domain, unsigned short port,
-                           int *latency_ms, volatile sig_atomic_t *cancel_flag) {
+                           int *latency_ms, atomic_bool *cancel_flag) {
     long long start;
     long long end;
     int socket_fd;
@@ -229,8 +365,8 @@ static int measure_latency(const struct fp_config *config, const char *domain, u
     if (start < 0) {
         return -1;
     }
-    socket_fd =
-        connect_through_forwarder(domain, port, FP_TEST_TIMEOUT_MS, FP_TEST_TIMEOUT_MS);
+    socket_fd = connect_through_forwarder(domain, port, FP_TEST_TIMEOUT_MS, FP_TEST_TIMEOUT_MS,
+                                          cancel_flag);
     end = now_ms();
     if (socket_fd < 0 || end < 0) {
         return cancelled(cancel_flag) ? -2 : -1;
@@ -243,8 +379,28 @@ static int measure_latency(const struct fp_config *config, const char *domain, u
     return 0;
 }
 
+static int http_response_success(const unsigned char *buffer, size_t header_length) {
+    size_t index;
+    int status;
+
+    if (header_length < 12 || memcmp(buffer, "HTTP/", 5) != 0) {
+        return 0;
+    }
+    for (index = 5; index < header_length && buffer[index] != ' ' && buffer[index] != '\r';
+         ++index) {
+    }
+    if (index + 3 >= header_length || buffer[index] != ' ' || buffer[index + 1] < '0' ||
+        buffer[index + 1] > '9' || buffer[index + 2] < '0' || buffer[index + 2] > '9' ||
+        buffer[index + 3] < '0' || buffer[index + 3] > '9') {
+        return 0;
+    }
+    status = (buffer[index + 1] - '0') * 100 + (buffer[index + 2] - '0') * 10 +
+             (buffer[index + 3] - '0');
+    return status >= 200 && status < 300;
+}
+
 static int skip_http_headers(int socket_fd, unsigned char *buffer, size_t capacity,
-                             size_t *body_offset, size_t *buffered, volatile sig_atomic_t *cancel_flag) {
+                             size_t *body_offset, size_t *buffered, atomic_bool *cancel_flag) {
     size_t used = 0;
 
     while (used + 1 < capacity) {
@@ -265,6 +421,9 @@ static int skip_http_headers(int socket_fd, unsigned char *buffer, size_t capaci
         for (index = 0; index + 3 < used; ++index) {
             if (buffer[index] == '\r' && buffer[index + 1] == '\n' && buffer[index + 2] == '\r' &&
                 buffer[index + 3] == '\n') {
+                if (!http_response_success(buffer, index + 4)) {
+                    return -1;
+                }
                 *body_offset = index + 4;
                 *buffered = used;
                 return 0;
@@ -277,7 +436,7 @@ static int skip_http_headers(int socket_fd, unsigned char *buffer, size_t capaci
 static int measure_speed(const struct fp_config *config, const struct speed_target *target,
                          size_t index, size_t total, size_t *bytes_downloaded, double *speed_mbps,
                          fp_test_event_callback on_event, void *context,
-                         volatile sig_atomic_t *cancel_flag) {
+                         atomic_bool *cancel_flag) {
     char request[256];
     unsigned char buffer[16384];
     struct fp_test_progress_event event;
@@ -298,7 +457,7 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
         return -2;
     }
     socket_fd = connect_through_forwarder(target->host, target->port, FP_TEST_SPEED_CONNECT_MS,
-                                          FP_TEST_SPEED_STALL_MS);
+                                          FP_TEST_SPEED_STALL_MS, cancel_flag);
     if (socket_fd < 0) {
         return cancelled(cancel_flag) ? -2 : -1;
     }
@@ -310,6 +469,13 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
         close(socket_fd);
         return -1;
     }
+    start = now_ms();
+    if (start < 0) {
+        close(socket_fd);
+        return -1;
+    }
+    deadline = start + FP_TEST_SPEED_TOTAL_MS;
+    last_emit = start;
     if (skip_http_headers(socket_fd, buffer, sizeof(buffer), &body_offset, &buffered, cancel_flag) !=
         0) {
         close(socket_fd);
@@ -323,13 +489,6 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
     if (downloaded > FP_TEST_SPEED_MAX_BYTES) {
         downloaded = FP_TEST_SPEED_MAX_BYTES;
     }
-    start = now_ms();
-    if (start < 0) {
-        close(socket_fd);
-        return -1;
-    }
-    deadline = start + FP_TEST_SPEED_TOTAL_MS;
-    last_emit = start;
     memset(&event, 0, sizeof(event));
     event.phase = FP_TEST_PHASE_SPEED;
     event.index = index;
@@ -386,7 +545,7 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
 
 static int run_site_tests(enum fp_test_mode mode, struct fp_config *config,
                           struct fp_test_report *report, fp_test_event_callback on_event,
-                          void *context, volatile sig_atomic_t *cancel_flag) {
+                          void *context, atomic_bool *cancel_flag) {
     enum fp_test_phase phase =
         mode == FP_TEST_MODE_LATENCY ? FP_TEST_PHASE_LATENCY : FP_TEST_PHASE_CONNECTIVITY;
     size_t index;
@@ -442,7 +601,7 @@ static int run_site_tests(enum fp_test_mode mode, struct fp_config *config,
 
 static int run_speed_tests(struct fp_config *config, struct fp_test_report *report,
                            fp_test_event_callback on_event, void *context,
-                           volatile sig_atomic_t *cancel_flag) {
+                           atomic_bool *cancel_flag) {
     size_t index;
 
     for (index = 0; index < report->speed_count; ++index) {
@@ -496,9 +655,388 @@ static int run_speed_tests(struct fp_config *config, struct fp_test_report *repo
     return 0;
 }
 
+static void diagnostic_emit(struct fp_diagnostic_report *report, size_t index,
+                            enum fp_diagnostic_state state,
+                            enum fp_diagnostic_reason reason, int error_code, int detail_code,
+                            fp_diagnostic_callback on_event, void *context) {
+    struct fp_diagnostic_item *item = &report->items[index];
+    struct fp_diagnostic_event event;
+
+    item->step = (enum fp_diagnostic_step)index;
+    item->state = state;
+    item->reason = reason;
+    item->error_code = error_code;
+    item->detail_code = detail_code;
+    if (state == FP_DIAGNOSTIC_OK || state == FP_DIAGNOSTIC_FAIL ||
+        state == FP_DIAGNOSTIC_CANCELLED) {
+        report->completed = index + 1;
+    }
+    if (on_event != NULL) {
+        memset(&event, 0, sizeof(event));
+        event.item = *item;
+        event.index = index + 1;
+        event.total = FP_DIAGNOSTIC_STEP_COUNT;
+        on_event(&event, context);
+    }
+}
+
+static void diagnostic_done(struct fp_diagnostic_report *report,
+                            fp_diagnostic_callback on_event, void *context) {
+    struct fp_diagnostic_event event;
+
+    if (on_event == NULL) {
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.item.step = FP_DIAGNOSTIC_DONE;
+    event.item.state = report->cancelled ? FP_DIAGNOSTIC_CANCELLED :
+                       report->success   ? FP_DIAGNOSTIC_OK :
+                                           FP_DIAGNOSTIC_FAIL;
+    event.item.reason = report->cancelled ? FP_DIAGNOSTIC_REASON_CANCELLED :
+                                            FP_DIAGNOSTIC_REASON_NONE;
+    event.index = report->completed;
+    event.total = FP_DIAGNOSTIC_STEP_COUNT;
+    on_event(&event, context);
+}
+
+static int diagnostic_cancel(struct fp_diagnostic_report *report, size_t index,
+                             fp_diagnostic_callback on_event, void *context,
+                             atomic_bool *cancel_flag) {
+    if (!cancelled(cancel_flag)) {
+        return 0;
+    }
+    report->cancelled = true;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_CANCELLED,
+                    FP_DIAGNOSTIC_REASON_CANCELLED, 0, 0, on_event, context);
+    diagnostic_done(report, on_event, context);
+    return 1;
+}
+
+static int diagnostic_fail(struct fp_diagnostic_report *report, size_t index,
+                           enum fp_diagnostic_reason reason, int error_code, int detail_code,
+                           fp_diagnostic_callback on_event, void *context) {
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_FAIL, reason, error_code, detail_code,
+                    on_event, context);
+    diagnostic_done(report, on_event, context);
+    return -1;
+}
+
+static int read_all_diagnostic(int socket_fd, void *buffer, size_t length) {
+    unsigned char *cursor = buffer;
+
+    while (length > 0) {
+        ssize_t received = recv(socket_fd, cursor, length, 0);
+
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            if (received == 0) {
+                errno = ECONNRESET;
+            }
+            return -1;
+        }
+        cursor += received;
+        length -= (size_t)received;
+    }
+    return 0;
+}
+
+static int diagnostic_proxy_tcp(const struct fp_config *config, int *error_code) {
+    struct sockaddr_in proxy = {
+        .sin_family = AF_INET,
+        .sin_addr = config->proxy_addr,
+        .sin_port = htons(config->proxy_port),
+    };
+    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (socket_fd < 0 ||
+        connect_with_timeout(socket_fd, (struct sockaddr *)&proxy, sizeof(proxy),
+                             FP_TEST_TIMEOUT_MS) != 0 ||
+        set_socket_timeouts(socket_fd, FP_TEST_TIMEOUT_MS) != 0) {
+        *error_code = errno;
+        if (socket_fd >= 0) {
+            close(socket_fd);
+        }
+        return -1;
+    }
+    return socket_fd;
+}
+
+static enum fp_diagnostic_reason diagnostic_socks_handshake(int socket_fd, int *error_code,
+                                                            int *detail_code) {
+    const unsigned char greeting[] = {0x05, 0x01, 0x00};
+    unsigned char response[2];
+
+    if (write_all(socket_fd, greeting, sizeof(greeting)) != 0 ||
+        read_all_diagnostic(socket_fd, response, sizeof(response)) != 0) {
+        *error_code = errno;
+        return FP_DIAGNOSTIC_REASON_SOCKS_IO;
+    }
+    if (response[0] != 0x05) {
+        *detail_code = response[0];
+        return FP_DIAGNOSTIC_REASON_SOCKS_VERSION;
+    }
+    if (response[1] != 0x00) {
+        *detail_code = response[1];
+        return FP_DIAGNOSTIC_REASON_SOCKS_AUTH;
+    }
+    return FP_DIAGNOSTIC_REASON_NONE;
+}
+
+static enum fp_diagnostic_reason diagnostic_socks_connect(
+    const struct fp_config *config, const struct sockaddr_in *destination,
+    int *error_code, int *detail_code, atomic_bool *cancel_flag) {
+    unsigned char request[10] = {0x05, 0x01, 0x00, 0x01};
+    unsigned char response[2];
+    enum fp_diagnostic_reason reason;
+    int socket_fd = diagnostic_proxy_tcp(config, error_code);
+
+    if (socket_fd < 0) {
+        return FP_DIAGNOSTIC_REASON_PROXY_UNREACHABLE;
+    }
+    reason = diagnostic_socks_handshake(socket_fd, error_code, detail_code);
+    if (reason != FP_DIAGNOSTIC_REASON_NONE) {
+        close(socket_fd);
+        return reason;
+    }
+    if (cancelled(cancel_flag)) {
+        close(socket_fd);
+        return FP_DIAGNOSTIC_REASON_CANCELLED;
+    }
+    memcpy(request + 4, &destination->sin_addr, 4);
+    memcpy(request + 8, &destination->sin_port, 2);
+    if (write_all(socket_fd, request, sizeof(request)) != 0 ||
+        read_all_diagnostic(socket_fd, response, sizeof(response)) != 0) {
+        *error_code = errno;
+        close(socket_fd);
+        return FP_DIAGNOSTIC_REASON_SOCKS_IO;
+    }
+    if (response[0] != 0x05) {
+        *detail_code = response[0];
+        close(socket_fd);
+        return FP_DIAGNOSTIC_REASON_SOCKS_VERSION;
+    }
+    if (response[1] != 0x00) {
+        *detail_code = response[1];
+        close(socket_fd);
+        return FP_DIAGNOSTIC_REASON_SOCKS_CONNECT_REJECTED;
+    }
+    if (fp_socks5_drain_bind(socket_fd) != 0) {
+        *error_code = errno;
+        close(socket_fd);
+        return FP_DIAGNOSTIC_REASON_SOCKS_IO;
+    }
+    close(socket_fd);
+    return FP_DIAGNOSTIC_REASON_NONE;
+}
+
+static int diagnostic_transparent_http(const struct sockaddr_in *destination,
+                                       atomic_bool *cancel_flag, int *error_code) {
+    static const char request[] =
+        "GET / HTTP/1.0\r\nHost: github.com\r\nConnection: close\r\n\r\n";
+    unsigned char response[5];
+    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (socket_fd < 0 ||
+        connect_with_timeout(socket_fd, (const struct sockaddr *)destination,
+                             sizeof(*destination), FP_TEST_TIMEOUT_MS) != 0 ||
+        set_socket_timeouts(socket_fd, FP_TEST_TIMEOUT_MS) != 0) {
+        *error_code = errno;
+        if (socket_fd >= 0) {
+            close(socket_fd);
+        }
+        return -1;
+    }
+    if (cancelled(cancel_flag)) {
+        close(socket_fd);
+        return -2;
+    }
+    if (write_all(socket_fd, request, sizeof(request) - 1) != 0 ||
+        read_all_diagnostic(socket_fd, response, sizeof(response)) != 0) {
+        *error_code = errno;
+        close(socket_fd);
+        return -1;
+    }
+    close(socket_fd);
+    if (memcmp(response, "HTTP/", sizeof(response)) != 0) {
+        *error_code = EPROTO;
+        return -1;
+    }
+    return 0;
+}
+
+int fp_diagnostic_run(struct fp_diagnostic_report *report, fp_diagnostic_callback on_event,
+                      void *context, atomic_bool *cancel_flag) {
+    static const char diagnostic_host[] = "github.com";
+    static const char diagnostic_service[] = "80";
+    struct fp_config config;
+    struct sockaddr_in listener = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(FP_LISTEN_PORT),
+    };
+    struct sockaddr_in destination;
+    struct addrinfo *addresses = NULL;
+    struct addrinfo *address;
+    enum fp_diagnostic_reason reason;
+    int resolver_error = 0;
+    int error_code = 0;
+    int detail_code = 0;
+    int socket_fd;
+    size_t index;
+
+    if (report == NULL) {
+        return -1;
+    }
+    memset(report, 0, sizeof(*report));
+    for (index = 0; index < FP_DIAGNOSTIC_STEP_COUNT; ++index) {
+        report->items[index].step = (enum fp_diagnostic_step)index;
+        report->items[index].state = FP_DIAGNOSTIC_PENDING;
+    }
+
+    index = FP_DIAGNOSTIC_CONFIG;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    if (!fp_config_exists()) {
+        return diagnostic_fail(report, index, FP_DIAGNOSTIC_REASON_CONFIG_MISSING,
+                               ENOENT, 0, on_event, context);
+    }
+    if (fp_config_load(&config) != 0) {
+        return diagnostic_fail(report, index, FP_DIAGNOSTIC_REASON_CONFIG_INVALID,
+                               EINVAL, 0, on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_DAEMON;
+    if (diagnostic_cancel(report, index, on_event, context, cancel_flag)) {
+        return -1;
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    if (!fp_daemon_matches_config(&config)) {
+        enum fp_diagnostic_reason daemon_reason = fp_read_pid() > 1 ?
+            FP_DIAGNOSTIC_REASON_DAEMON_CONFIG_MISMATCH :
+            FP_DIAGNOSTIC_REASON_DAEMON_STOPPED;
+        return diagnostic_fail(report, index, daemon_reason, ESRCH, 0, on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_LISTENER;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0 ||
+        connect_with_timeout(socket_fd, (struct sockaddr *)&listener, sizeof(listener),
+                             FP_TEST_TIMEOUT_MS) != 0) {
+        error_code = errno;
+        if (socket_fd >= 0) {
+            close(socket_fd);
+        }
+        return diagnostic_fail(report, index, FP_DIAGNOSTIC_REASON_LISTENER_UNREACHABLE,
+                               error_code, 0, on_event, context);
+    }
+    close(socket_fd);
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_FIREWALL;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    if (!fp_firewall_is_enabled(&config)) {
+        return diagnostic_fail(report, index, FP_DIAGNOSTIC_REASON_FIREWALL_INCOMPLETE,
+                               0, 0, on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_PROXY_TCP;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    socket_fd = diagnostic_proxy_tcp(&config, &error_code);
+    if (socket_fd < 0) {
+        return diagnostic_fail(report, index, FP_DIAGNOSTIC_REASON_PROXY_UNREACHABLE,
+                               error_code, 0, on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_SOCKS5;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    reason = diagnostic_socks_handshake(socket_fd, &error_code, &detail_code);
+    close(socket_fd);
+    if (reason != FP_DIAGNOSTIC_REASON_NONE) {
+        return diagnostic_fail(report, index, reason, error_code, detail_code, on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_DNS;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    if (resolve_ipv4(diagnostic_host, diagnostic_service, &addresses, cancel_flag,
+                     &resolver_error) != 0 || addresses == NULL) {
+        if (diagnostic_cancel(report, index, on_event, context, cancel_flag)) {
+            return -1;
+        }
+        return diagnostic_fail(report, index, FP_DIAGNOSTIC_REASON_DNS_FAILED,
+                               resolver_error, 0, on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_SOCKS_CONNECT;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    reason = FP_DIAGNOSTIC_REASON_INTERNAL;
+    for (address = addresses; address != NULL; address = address->ai_next) {
+        if (address->ai_addrlen < sizeof(destination)) {
+            continue;
+        }
+        memcpy(&destination, address->ai_addr, sizeof(destination));
+        error_code = 0;
+        detail_code = 0;
+        reason = diagnostic_socks_connect(&config, &destination, &error_code,
+                                          &detail_code, cancel_flag);
+        if (reason == FP_DIAGNOSTIC_REASON_NONE || cancelled(cancel_flag)) {
+            break;
+        }
+    }
+    freeaddrinfo(addresses);
+    addresses = NULL;
+    if (reason != FP_DIAGNOSTIC_REASON_NONE) {
+        if (diagnostic_cancel(report, index, on_event, context, cancel_flag)) {
+            return -1;
+        }
+        return diagnostic_fail(report, index, reason, error_code, detail_code,
+                               on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+
+    index = FP_DIAGNOSTIC_TRANSPARENT;
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_RUNNING, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    if (diagnostic_transparent_http(&destination, cancel_flag, &error_code) != 0) {
+        if (diagnostic_cancel(report, index, on_event, context, cancel_flag)) {
+            return -1;
+        }
+        return diagnostic_fail(report, index, FP_DIAGNOSTIC_REASON_TRANSPARENT_FAILED,
+                               error_code, 0, on_event, context);
+    }
+    diagnostic_emit(report, index, FP_DIAGNOSTIC_OK, FP_DIAGNOSTIC_REASON_NONE,
+                    0, 0, on_event, context);
+    report->success = true;
+    diagnostic_done(report, on_event, context);
+    return 0;
+}
+
 int fp_test_run(enum fp_test_mode mode, struct fp_test_report *report,
                 fp_test_event_callback on_event, void *context,
-                volatile sig_atomic_t *cancel_flag) {
+                atomic_bool *cancel_flag) {
     struct fp_config config;
     struct fp_test_progress_event event;
     size_t index;

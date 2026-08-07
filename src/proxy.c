@@ -165,6 +165,7 @@ static int connect_socks(const struct fp_config *config, const struct sockaddr_i
 }
 
 static void relay(int client_fd, int upstream_fd, int stats_slot) {
+    int endpoints[2] = {client_fd, upstream_fd};
     struct pollfd descriptors[2] = {
         {.fd = client_fd, .events = POLLIN},
         {.fd = upstream_fd, .events = POLLIN},
@@ -181,16 +182,21 @@ static void relay(int client_fd, int upstream_fd, int stats_slot) {
             return;
         }
         for (size_t index = 0; index < 2; ++index) {
-            int source = descriptors[index].fd;
-            int target = descriptors[1 - index].fd;
+            int source = endpoints[index];
+            int target = endpoints[1 - index];
             ssize_t received;
 
-            if ((descriptors[index].revents & (POLLIN | POLLHUP)) == 0) {
+            if (descriptors[index].fd < 0 ||
+                (descriptors[index].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) == 0) {
                 continue;
             }
             received = recv(source, buffer, sizeof(buffer), 0);
+            if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
             if (received <= 0) {
                 shutdown(target, SHUT_WR);
+                descriptors[index].fd = -1;
                 descriptors[index].events = 0;
                 continue;
             }
@@ -203,7 +209,7 @@ static void relay(int client_fd, int upstream_fd, int stats_slot) {
                 fp_stats_add(stats_slot, 0, (uint64_t)received);
             }
         }
-        if (descriptors[0].events == 0 && descriptors[1].events == 0) {
+        if (descriptors[0].fd < 0 && descriptors[1].fd < 0) {
             return;
         }
     }
@@ -284,6 +290,7 @@ int fp_proxy_run(const struct fp_config *config, int ready_fd) {
     }
     if (fp_stats_create() != 0 || fp_write_pid(config) != 0 || fp_firewall_enable(config) != 0) {
         close(listener);
+        fp_remove_pid();
         fp_stats_close();
         (void)fp_firewall_disable();
         signal_ready(ready_fd, 'E');

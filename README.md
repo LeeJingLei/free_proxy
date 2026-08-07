@@ -69,6 +69,7 @@ Run `sudo free_proxy` at any time to open the controller.
 | `a` | Enable or disable start at boot |
 | `m` | Open the traffic monitor (live rates, totals, active connections) |
 | `t` | Open the network test page (choose connectivity, latency, or speed) |
+| `c` | Diagnose configuration, daemon, iptables, SOCKS5, DNS, and transparent forwarding |
 | `u` | Uninstall after typing the exact confirmation `yes` |
 | `l` | Switch the controller between English and Chinese |
 | `r` | Refresh status |
@@ -77,6 +78,8 @@ Run `sudo free_proxy` at any time to open the controller.
 The proxy input accepts the main keyboard and numeric keypad. In the input field, press `q` or `Esc` to cancel without changing the configuration.
 
 Press `m` to open the traffic monitor. While the forwarder is running it shows live upload/download speed, totals since daemon start, and active destinations as `IPv4:PORT` with per-connection byte counts. From that page press `1` / `2` / `3` for connectivity, latency, or speed tests.
+
+Press `c` to run a read-only connection diagnosis. It stops at the first failed stage and reports whether the problem is the saved configuration, forwarder, local listener, iptables rules, proxy TCP port, SOCKS5 protocol/authentication, local DNS, proxy outbound connection, or transparent forwarding path.
 
 Press `t` to open the network test page, then choose `1` connectivity, `2` latency, or `3` download speed. Connectivity and latency check 25 common international sites through SOCKS5. Speed downloads up to 10 MiB and shows live Mbps while running. Press `q` to cancel a running test or leave the menu. The result screen shows pass counts and failed targets.
 

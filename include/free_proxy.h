@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -111,6 +112,71 @@ struct fp_test_progress_event {
 
 typedef void (*fp_test_event_callback)(const struct fp_test_progress_event *event, void *context);
 
+#define FP_DIAGNOSTIC_STEP_COUNT 9
+
+enum fp_diagnostic_step {
+    FP_DIAGNOSTIC_CONFIG,
+    FP_DIAGNOSTIC_DAEMON,
+    FP_DIAGNOSTIC_LISTENER,
+    FP_DIAGNOSTIC_FIREWALL,
+    FP_DIAGNOSTIC_PROXY_TCP,
+    FP_DIAGNOSTIC_SOCKS5,
+    FP_DIAGNOSTIC_DNS,
+    FP_DIAGNOSTIC_SOCKS_CONNECT,
+    FP_DIAGNOSTIC_TRANSPARENT,
+    FP_DIAGNOSTIC_DONE,
+};
+
+enum fp_diagnostic_state {
+    FP_DIAGNOSTIC_PENDING,
+    FP_DIAGNOSTIC_RUNNING,
+    FP_DIAGNOSTIC_OK,
+    FP_DIAGNOSTIC_FAIL,
+    FP_DIAGNOSTIC_CANCELLED,
+};
+
+enum fp_diagnostic_reason {
+    FP_DIAGNOSTIC_REASON_NONE,
+    FP_DIAGNOSTIC_REASON_CANCELLED,
+    FP_DIAGNOSTIC_REASON_CONFIG_MISSING,
+    FP_DIAGNOSTIC_REASON_CONFIG_INVALID,
+    FP_DIAGNOSTIC_REASON_DAEMON_STOPPED,
+    FP_DIAGNOSTIC_REASON_DAEMON_CONFIG_MISMATCH,
+    FP_DIAGNOSTIC_REASON_LISTENER_UNREACHABLE,
+    FP_DIAGNOSTIC_REASON_FIREWALL_INCOMPLETE,
+    FP_DIAGNOSTIC_REASON_PROXY_UNREACHABLE,
+    FP_DIAGNOSTIC_REASON_SOCKS_IO,
+    FP_DIAGNOSTIC_REASON_SOCKS_VERSION,
+    FP_DIAGNOSTIC_REASON_SOCKS_AUTH,
+    FP_DIAGNOSTIC_REASON_DNS_FAILED,
+    FP_DIAGNOSTIC_REASON_SOCKS_CONNECT_REJECTED,
+    FP_DIAGNOSTIC_REASON_TRANSPARENT_FAILED,
+    FP_DIAGNOSTIC_REASON_INTERNAL,
+};
+
+struct fp_diagnostic_item {
+    enum fp_diagnostic_step step;
+    enum fp_diagnostic_state state;
+    enum fp_diagnostic_reason reason;
+    int error_code;
+    int detail_code;
+};
+
+struct fp_diagnostic_report {
+    struct fp_diagnostic_item items[FP_DIAGNOSTIC_STEP_COUNT];
+    size_t completed;
+    bool success;
+    bool cancelled;
+};
+
+struct fp_diagnostic_event {
+    struct fp_diagnostic_item item;
+    size_t index;
+    size_t total;
+};
+
+typedef void (*fp_diagnostic_callback)(const struct fp_diagnostic_event *event, void *context);
+
 int fp_parse_proxy(const char *value, struct fp_config *config);
 int fp_config_load(struct fp_config *config);
 int fp_config_save(const struct fp_config *config);
@@ -166,7 +232,10 @@ int fp_stats_snapshot(struct fp_stats_snapshot *snapshot);
 
 int fp_test_run(enum fp_test_mode mode, struct fp_test_report *report,
                 fp_test_event_callback on_event, void *context,
-                volatile sig_atomic_t *cancel_flag);
+                atomic_bool *cancel_flag);
+
+int fp_diagnostic_run(struct fp_diagnostic_report *report, fp_diagnostic_callback on_event,
+                      void *context, atomic_bool *cancel_flag);
 
 int fp_autostart_enable(void);
 int fp_autostart_disable(void);

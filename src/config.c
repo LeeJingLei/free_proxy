@@ -63,6 +63,7 @@ enum fp_ui_language fp_ui_language_load(void) {
 
 int fp_ui_language_save(enum fp_ui_language language) {
     FILE *file;
+    int result = 0;
 
     if (ensure_config_dir() != 0) {
         return -1;
@@ -71,11 +72,13 @@ int fp_ui_language_save(enum fp_ui_language language) {
     if (file == NULL) {
         return -1;
     }
-    if (fputs(language == FP_UI_LANGUAGE_EN ? "en\n" : "zh\n", file) == EOF ||
-        fclose(file) != 0) {
-        return -1;
+    if (fputs(language == FP_UI_LANGUAGE_EN ? "en\n" : "zh\n", file) == EOF) {
+        result = -1;
     }
-    return 0;
+    if (fclose(file) != 0) {
+        result = -1;
+    }
+    return result;
 }
 
 int fp_config_save(const struct fp_config *config) {
@@ -83,6 +86,7 @@ int fp_config_save(const struct fp_config *config) {
     char temporary_path[sizeof(FP_CONFIG_PATH) + 16];
     int file_descriptor;
     int length;
+    int write_result = 0;
 
     if (ensure_config_dir() != 0) {
         return -1;
@@ -100,7 +104,13 @@ int fp_config_save(const struct fp_config *config) {
         return -1;
     }
     if (dprintf(file_descriptor, "proxy=%s:%u\n", address, config->proxy_port) < 0 ||
-        fsync(file_descriptor) != 0 || close(file_descriptor) != 0) {
+        fsync(file_descriptor) != 0) {
+        write_result = -1;
+    }
+    if (close(file_descriptor) != 0) {
+        write_result = -1;
+    }
+    if (write_result != 0) {
         unlink(temporary_path);
         return -1;
     }

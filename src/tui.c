@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <locale.h>
+#include <netdb.h>
 #include <ncursesw/ncurses.h>
 #include <poll.h>
 #include <pthread.h>
@@ -35,6 +36,7 @@ struct ui_text {
     const char *startup;
     const char *monitor;
     const char *test;
+    const char *diagnostic;
     const char *uninstall;
     const char *language;
     const char *refresh;
@@ -71,6 +73,7 @@ static const struct ui_text UI_TEXT[] = {
          "a  切换开机自启",
          "m  流量与连接监控",
          "t  打开网络测试页",
+         "c  连接诊断",
          "u  卸载 free_proxy",
          "l  切换语言（中文/English）",
          "r  立即刷新",
@@ -104,6 +107,7 @@ static const struct ui_text UI_TEXT[] = {
          "a  Toggle boot startup",
          "m  Traffic and connection monitor",
          "t  Open network test page",
+         "c  Connection diagnostics",
          "u  Uninstall free_proxy",
          "l  Switch language (中文/English)",
          "r  Refresh now",
@@ -176,11 +180,12 @@ static void draw_screen(const struct fp_status *status, const struct ui_text *te
     mvprintw(13, 4, "%s", text->startup);
     mvprintw(14, 4, "%s", text->monitor);
     mvprintw(15, 4, "%s", text->test);
-    mvprintw(16, 4, "%s", text->uninstall);
-    mvprintw(17, 4, "%s", text->language);
-    mvprintw(18, 4, "%s", text->refresh);
-    mvprintw(19, 4, "%s", text->quit);
-    mvprintw(20, 4, "%s", text->coverage);
+    mvprintw(16, 4, "%s", text->diagnostic);
+    mvprintw(17, 4, "%s", text->uninstall);
+    mvprintw(18, 4, "%s", text->language);
+    mvprintw(19, 4, "%s", text->refresh);
+    mvprintw(20, 4, "%s", text->quit);
+    mvprintw(21, 4, "%s", text->coverage);
 
     if (message[0] != '\0') {
         attron(A_BOLD);
@@ -194,7 +199,7 @@ struct test_worker_args {
     enum fp_test_mode mode;
     struct fp_test_report *report;
     int event_fd;
-    volatile sig_atomic_t *cancel_flag;
+    atomic_bool *cancel_flag;
 };
 
 static void write_test_event(const struct fp_test_progress_event *event, void *context) {
@@ -486,12 +491,13 @@ static void run_selected_test(enum fp_ui_language language, enum fp_test_mode mo
     struct fp_test_progress_event event;
     struct test_worker_args args;
     pthread_t worker;
-    volatile sig_atomic_t cancel_flag = 0;
+    atomic_bool cancel_flag;
     int pipe_fds[2];
     int cancelling = 0;
     int finished = 0;
 
     memset(&report, 0, sizeof(report));
+    atomic_init(&cancel_flag, false);
     memset(&event, 0, sizeof(event));
     event.phase = FP_TEST_PHASE_PREFLIGHT;
     event.index = 1;
@@ -524,7 +530,7 @@ static void run_selected_test(enum fp_ui_language language, enum fp_test_mode mo
         int poll_result;
 
         if ((key == 'q' || key == 'Q') && !cancelling) {
-            cancel_flag = 1;
+            atomic_store_explicit(&cancel_flag, true, memory_order_release);
             cancelling = 1;
             draw_test_progress(language, mode, &event, 1);
         }
@@ -600,6 +606,352 @@ static void run_test_page(enum fp_ui_language language, char *message, size_t me
     timeout(1000);
 }
 
+struct diagnostic_worker_args {
+    struct fp_diagnostic_report *report;
+    int event_fd;
+    atomic_bool *cancel_flag;
+};
+
+static void write_diagnostic_event(const struct fp_diagnostic_event *event, void *context) {
+    struct diagnostic_worker_args *args = context;
+    const unsigned char *cursor = (const unsigned char *)event;
+    size_t remaining = sizeof(*event);
+
+    while (remaining > 0) {
+        ssize_t written = write(args->event_fd, cursor, remaining);
+
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+}
+
+static void *diagnostic_worker_main(void *context) {
+    struct diagnostic_worker_args *args = context;
+
+    (void)fp_diagnostic_run(args->report, write_diagnostic_event, args, args->cancel_flag);
+    return NULL;
+}
+
+static int read_diagnostic_event(int event_fd, struct fp_diagnostic_event *event) {
+    unsigned char *cursor = (unsigned char *)event;
+    size_t remaining = sizeof(*event);
+
+    while (remaining > 0) {
+        ssize_t received = read(event_fd, cursor, remaining);
+
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            return -1;
+        }
+        cursor += received;
+        remaining -= (size_t)received;
+    }
+    return 0;
+}
+
+static const char *diagnostic_step_name(enum fp_ui_language language,
+                                        enum fp_diagnostic_step step) {
+    static const char *const zh[] = {
+        "代理配置", "转发进程", "本地监听", "iptables 规则", "代理端口",
+        "SOCKS5 协议", "本地 DNS", "代理出站", "透明转发",
+    };
+    static const char *const en[] = {
+        "Proxy config", "Forwarder", "Local listener", "iptables rules", "Proxy TCP",
+        "SOCKS5 protocol", "Local DNS", "Proxy outbound", "Transparent path",
+    };
+
+    if (step < 0 || step >= FP_DIAGNOSTIC_DONE) {
+        return language == FP_UI_LANGUAGE_ZH ? "完成" : "Done";
+    }
+    return language == FP_UI_LANGUAGE_ZH ? zh[step] : en[step];
+}
+
+static const char *diagnostic_socket_error(enum fp_ui_language language, int error_code) {
+    switch (error_code) {
+        case ETIMEDOUT:
+            return language == FP_UI_LANGUAGE_ZH ? "连接超时" : "connection timed out";
+        case EAGAIN:
+            return language == FP_UI_LANGUAGE_ZH ? "等待响应超时" : "response timed out";
+        case ECONNREFUSED:
+            return language == FP_UI_LANGUAGE_ZH ? "端口拒绝连接" : "connection refused";
+        case ENETUNREACH:
+            return language == FP_UI_LANGUAGE_ZH ? "网络不可达" : "network unreachable";
+        case EHOSTUNREACH:
+            return language == FP_UI_LANGUAGE_ZH ? "目标主机不可达" : "host unreachable";
+        case EACCES:
+        case EPERM:
+            return language == FP_UI_LANGUAGE_ZH ? "权限或防火墙拒绝" : "permission denied";
+        case EPROTO:
+            return language == FP_UI_LANGUAGE_ZH ? "目标返回了非 HTTP 数据" : "non-HTTP response";
+        case 0:
+            return language == FP_UI_LANGUAGE_ZH ? "未知连接错误" : "unknown connection error";
+        default:
+            return strerror(error_code);
+    }
+}
+
+static const char *diagnostic_socks_reply(enum fp_ui_language language, int reply) {
+    static const char *const zh[] = {
+        "成功", "代理服务器内部错误", "代理规则拒绝", "代理侧网络不可达",
+        "代理侧目标不可达", "目标端口拒绝连接", "TTL 超时", "代理不支持 CONNECT",
+        "代理不支持目标地址类型",
+    };
+    static const char *const en[] = {
+        "success", "general proxy failure", "denied by proxy rules", "proxy network unreachable",
+        "target host unreachable", "target connection refused", "TTL expired",
+        "CONNECT unsupported", "address type unsupported",
+    };
+
+    if (reply < 0 || reply > 8) {
+        return language == FP_UI_LANGUAGE_ZH ? "未知 SOCKS5 错误" : "unknown SOCKS5 error";
+    }
+    return language == FP_UI_LANGUAGE_ZH ? zh[reply] : en[reply];
+}
+
+static void format_diagnostic_reason(enum fp_ui_language language,
+                                     const struct fp_diagnostic_item *item,
+                                     char *buffer, size_t buffer_size) {
+    switch (item->reason) {
+        case FP_DIAGNOSTIC_REASON_CANCELLED:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "用户取消了诊断。" :
+                                                           "Diagnostic cancelled by user.");
+            break;
+        case FP_DIAGNOSTIC_REASON_CONFIG_MISSING:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "尚未保存 SOCKS5 代理地址，请先按 e 配置。" :
+                                                           "No SOCKS5 address saved; configure it with e.");
+            break;
+        case FP_DIAGNOSTIC_REASON_CONFIG_INVALID:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "配置文件格式无效，请重新输入代理地址。" :
+                                                           "The configuration file is invalid; enter the proxy again.");
+            break;
+        case FP_DIAGNOSTIC_REASON_DAEMON_STOPPED:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "转发进程未运行，请按 s 启用代理。" :
+                                                           "The forwarder is not running; enable it with s.");
+            break;
+        case FP_DIAGNOSTIC_REASON_DAEMON_CONFIG_MISMATCH:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "运行进程与当前配置不匹配，可能是旧 PID 或旧配置。" :
+                                                           "The running process does not match the saved configuration.");
+            break;
+        case FP_DIAGNOSTIC_REASON_LISTENER_UNREACHABLE:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "本地 127.0.0.1:%d 不通：%s。" :
+                                                           "Local 127.0.0.1:%d failed: %s.",
+                           FP_LISTEN_PORT, diagnostic_socket_error(language, item->error_code));
+            break;
+        case FP_DIAGNOSTIC_REASON_FIREWALL_INCOMPLETE:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "FPROXY_OUT 或 OUTPUT 跳转规则缺失/不完整。" :
+                                                           "FPROXY_OUT or its OUTPUT jump is missing/incomplete.");
+            break;
+        case FP_DIAGNOSTIC_REASON_PROXY_UNREACHABLE:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "无法连接 SOCKS5 代理：%s。" :
+                                                           "Cannot reach the SOCKS5 proxy: %s.",
+                           diagnostic_socket_error(language, item->error_code));
+            break;
+        case FP_DIAGNOSTIC_REASON_SOCKS_IO:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "SOCKS5 握手中断：%s。" :
+                                                           "SOCKS5 handshake I/O failed: %s.",
+                           diagnostic_socket_error(language, item->error_code));
+            break;
+        case FP_DIAGNOSTIC_REASON_SOCKS_VERSION:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "目标端口不是 SOCKS5 服务（版本 0x%02x）。" :
+                                                           "The endpoint is not SOCKS5 (version 0x%02x).",
+                           item->detail_code & 0xff);
+            break;
+        case FP_DIAGNOSTIC_REASON_SOCKS_AUTH:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ?
+                               "代理不接受无认证方式（方法 0x%02x），当前程序不支持账号密码。" :
+                               "The proxy rejected no-auth (method 0x%02x); credentials are unsupported.",
+                           item->detail_code & 0xff);
+            break;
+        case FP_DIAGNOSTIC_REASON_DNS_FAILED:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "本地 DNS 无法解析 github.com：%s。" :
+                                                           "Local DNS cannot resolve github.com: %s.",
+                           item->error_code != 0 ? gai_strerror(item->error_code) :
+                                                  diagnostic_socket_error(language, 0));
+            break;
+        case FP_DIAGNOSTIC_REASON_SOCKS_CONNECT_REJECTED:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "代理无法连接 github.com:80：%s。" :
+                                                           "Proxy cannot reach github.com:80: %s.",
+                           diagnostic_socks_reply(language, item->detail_code));
+            break;
+        case FP_DIAGNOSTIC_REASON_TRANSPARENT_FAILED:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ?
+                               "代理直连已通过，但透明链路未收到有效响应：%s。请检查 REDIRECT/original-dst。" :
+                               "Direct SOCKS passed, but transparent forwarding failed: %s.",
+                           diagnostic_socket_error(language, item->error_code));
+            break;
+        default:
+            (void)snprintf(buffer, buffer_size,
+                           language == FP_UI_LANGUAGE_ZH ? "内部诊断错误。" :
+                                                           "Internal diagnostic error.");
+            break;
+    }
+}
+
+static void draw_diagnostic_progress(enum fp_ui_language language,
+                                     const struct fp_diagnostic_event *event, int cancelling) {
+    const char *title = language == FP_UI_LANGUAGE_ZH ? "连接诊断" : "Connection diagnostics";
+    const char *hint = language == FP_UI_LANGUAGE_ZH ? "按 q 取消诊断" : "Press q to cancel";
+
+    erase();
+    attron(A_BOLD | A_UNDERLINE);
+    mvprintw(2, 4, "%s", title);
+    attroff(A_BOLD | A_UNDERLINE);
+    mvhline(3, 2, '-', COLS - 4);
+    mvprintw(6, 4,
+             language == FP_UI_LANGUAGE_ZH ? "步骤 %zu/%zu：%s" : "Step %zu/%zu: %s",
+             event->index, event->total,
+             diagnostic_step_name(language, event->item.step));
+    mvprintw(8, 4, "%s", cancelling ?
+             (language == FP_UI_LANGUAGE_ZH ? "正在取消…" : "Cancelling…") :
+             (language == FP_UI_LANGUAGE_ZH ? "正在检查…" : "Checking…"));
+    attron(A_BOLD);
+    mvprintw(LINES - 2, 4, "%s", hint);
+    attroff(A_BOLD);
+    refresh();
+}
+
+static void draw_diagnostic_results(enum fp_ui_language language,
+                                    const struct fp_diagnostic_report *report) {
+    const char *title = language == FP_UI_LANGUAGE_ZH ? "连接诊断结果" : "Diagnostic results";
+    char reason[256] = "";
+    size_t index;
+    int row = 5;
+
+    erase();
+    attron(A_BOLD | A_UNDERLINE);
+    mvprintw(2, 4, "%s", title);
+    attroff(A_BOLD | A_UNDERLINE);
+    mvhline(3, 2, '-', COLS - 4);
+    for (index = 0; index < FP_DIAGNOSTIC_STEP_COUNT && row < LINES - 6; ++index) {
+        const struct fp_diagnostic_item *item = &report->items[index];
+        const char *mark;
+
+        if (item->state == FP_DIAGNOSTIC_PENDING) {
+            break;
+        }
+        mark = item->state == FP_DIAGNOSTIC_OK ? "OK" :
+               item->state == FP_DIAGNOSTIC_FAIL ? "FAIL" :
+               item->state == FP_DIAGNOSTIC_CANCELLED ? "STOP" : "...";
+        mvprintw(row++, 4, "[%s] %s", mark, diagnostic_step_name(language, item->step));
+        if (item->state == FP_DIAGNOSTIC_FAIL || item->state == FP_DIAGNOSTIC_CANCELLED) {
+            format_diagnostic_reason(language, item, reason, sizeof(reason));
+        }
+    }
+    if (report->success) {
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(LINES - 5, 4, "%s",
+                 language == FP_UI_LANGUAGE_ZH ? "全部检查通过，透明代理链路可用。" :
+                                                 "All checks passed; the transparent proxy path works.");
+        attroff(COLOR_PAIR(1) | A_BOLD);
+    } else if (reason[0] != '\0') {
+        attron(COLOR_PAIR(2) | A_BOLD);
+        mvprintw(LINES - 5, 4, "%s", reason);
+        attroff(COLOR_PAIR(2) | A_BOLD);
+    }
+    attron(A_BOLD);
+    mvprintw(LINES - 2, 4, "%s",
+             language == FP_UI_LANGUAGE_ZH ? "按任意键返回主页" : "Press any key to return");
+    attroff(A_BOLD);
+    refresh();
+    timeout(-1);
+    (void)getch();
+}
+
+static void run_diagnostic_page(enum fp_ui_language language, char *message, size_t message_size) {
+    struct fp_diagnostic_report report;
+    struct fp_diagnostic_event event;
+    struct diagnostic_worker_args args;
+    pthread_t worker;
+    atomic_bool cancel_flag;
+    int pipe_fds[2];
+    int cancelling = 0;
+    int finished = 0;
+
+    memset(&report, 0, sizeof(report));
+    memset(&event, 0, sizeof(event));
+    event.item.step = FP_DIAGNOSTIC_CONFIG;
+    event.index = 1;
+    event.total = FP_DIAGNOSTIC_STEP_COUNT;
+    atomic_init(&cancel_flag, false);
+    if (pipe(pipe_fds) != 0) {
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "无法启动连接诊断。" :
+                                                       "Unable to start diagnostics.");
+        return;
+    }
+    args.report = &report;
+    args.event_fd = pipe_fds[1];
+    args.cancel_flag = &cancel_flag;
+    draw_diagnostic_progress(language, &event, 0);
+    if (pthread_create(&worker, NULL, diagnostic_worker_main, &args) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        (void)snprintf(message, message_size,
+                       language == FP_UI_LANGUAGE_ZH ? "无法启动连接诊断。" :
+                                                       "Unable to start diagnostics.");
+        return;
+    }
+    nodelay(stdscr, TRUE);
+    while (!finished) {
+        struct pollfd descriptor = {.fd = pipe_fds[0], .events = POLLIN};
+        int key = getch();
+        int poll_result;
+
+        if ((key == 'q' || key == 'Q') && !cancelling) {
+            atomic_store_explicit(&cancel_flag, true, memory_order_release);
+            cancelling = 1;
+            draw_diagnostic_progress(language, &event, 1);
+        }
+        poll_result = poll(&descriptor, 1, 100);
+        if (poll_result > 0 && (descriptor.revents & POLLIN) != 0) {
+            if (read_diagnostic_event(pipe_fds[0], &event) != 0 ||
+                event.item.step == FP_DIAGNOSTIC_DONE) {
+                finished = 1;
+            } else {
+                draw_diagnostic_progress(language, &event, cancelling);
+            }
+        } else if (poll_result < 0 && errno != EINTR) {
+            finished = 1;
+        }
+    }
+    nodelay(stdscr, FALSE);
+    (void)pthread_join(worker, NULL);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    draw_diagnostic_results(language, &report);
+    (void)snprintf(message, message_size,
+                   report.success ?
+                       (language == FP_UI_LANGUAGE_ZH ? "连接诊断通过。" : "Diagnostics passed.") :
+                       report.cancelled ?
+                           (language == FP_UI_LANGUAGE_ZH ? "连接诊断已取消。" :
+                                                           "Diagnostics cancelled.") :
+                           (language == FP_UI_LANGUAGE_ZH ? "连接诊断发现故障。" :
+                                                           "Diagnostics found a failure."));
+    timeout(1000);
+}
+
 static void format_bytes(char *buffer, size_t buffer_size, uint64_t bytes) {
     if (bytes >= 1024ull * 1024ull * 1024ull) {
         (void)snprintf(buffer, buffer_size, "%.2f GiB",
@@ -637,6 +989,7 @@ static void format_duration(char *buffer, size_t buffer_size, uint64_t age_ms) {
 }
 
 struct monitor_rate_state {
+    uint64_t anchor_started_ms;
     uint64_t anchor_up;
     uint64_t anchor_down;
     struct timespec anchor_time;
@@ -655,10 +1008,13 @@ static double timespec_elapsed_ms(const struct timespec *start, const struct tim
  * window so the value tracks throughput without jumping through zero.
  */
 static void update_monitor_rates(struct monitor_rate_state *state, uint64_t total_up,
-                                 uint64_t total_down, const struct timespec *now) {
+                                 uint64_t total_down, uint64_t started_ms,
+                                 const struct timespec *now) {
     double elapsed_ms;
 
-    if (!state->has_anchor) {
+    if (!state->has_anchor || state->anchor_started_ms != started_ms ||
+        total_up < state->anchor_up || total_down < state->anchor_down) {
+        state->anchor_started_ms = started_ms;
         state->anchor_up = total_up;
         state->anchor_down = total_down;
         state->anchor_time = *now;
@@ -818,12 +1174,13 @@ static void run_monitor_test(enum fp_ui_language language, enum fp_test_mode mod
     struct fp_stats_snapshot snapshot;
     struct fp_status status;
     pthread_t worker;
-    volatile sig_atomic_t cancel_flag = 0;
+    atomic_bool cancel_flag;
     int pipe_fds[2];
     int cancelling = 0;
     int finished = 0;
 
     memset(&report, 0, sizeof(report));
+    atomic_init(&cancel_flag, false);
     memset(&event, 0, sizeof(event));
     if (pipe(pipe_fds) != 0) {
         (void)snprintf(status_line, status_size,
@@ -853,7 +1210,7 @@ static void run_monitor_test(enum fp_ui_language language, enum fp_test_mode mod
         int poll_result;
 
         if ((key == 'q' || key == 'Q') && !cancelling) {
-            cancel_flag = 1;
+            atomic_store_explicit(&cancel_flag, true, memory_order_release);
             cancelling = 1;
             (void)snprintf(status_line, status_size,
                            language == FP_UI_LANGUAGE_ZH ? "正在取消测试…" : "Cancelling test…");
@@ -867,7 +1224,8 @@ static void run_monitor_test(enum fp_ui_language language, enum fp_test_mode mod
         }
         (void)clock_gettime(CLOCK_MONOTONIC, &now);
         if (snapshot.available) {
-            update_monitor_rates(rates, snapshot.total_up, snapshot.total_down, &now);
+            update_monitor_rates(rates, snapshot.total_up, snapshot.total_down,
+                                 snapshot.started_ms, &now);
         }
 
         poll_result = poll(descriptors, 1, 50);
@@ -931,7 +1289,8 @@ static void run_monitor_page(enum fp_ui_language language, char *message, size_t
         }
         (void)clock_gettime(CLOCK_MONOTONIC, &now);
         if (snapshot.available) {
-            update_monitor_rates(&rates, snapshot.total_up, snapshot.total_down, &now);
+            update_monitor_rates(&rates, snapshot.total_up, snapshot.total_down,
+                                 snapshot.started_ms, &now);
         } else {
             memset(&rates, 0, sizeof(rates));
         }
@@ -1169,6 +1528,8 @@ int fp_tui_run(void) {
             run_monitor_page(language, message, sizeof(message));
         } else if (key == 't' || key == 'T') {
             run_test_page(language, message, sizeof(message));
+        } else if (key == 'c' || key == 'C') {
+            run_diagnostic_page(language, message, sizeof(message));
         } else if (key == 'u' || key == 'U') {
             if (!confirm_uninstall(language)) {
                 (void)snprintf(message, sizeof(message),
