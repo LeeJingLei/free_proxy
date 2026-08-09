@@ -1,7 +1,8 @@
 CC ?= cc
 CPPFLAGS := -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -Iinclude
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
-LDLIBS := -lncursesw -lpthread
+LDLIBS := -lncursesw -lcurl -lpthread
+TEST_LDLIBS := -lcurl -lpthread
 
 APT_GET ?= apt-get
 AUTO_INSTALL_DEPS ?= 1
@@ -28,11 +29,21 @@ dependencies:
 			clang) missing_packages="$$missing_packages clang" ;; \
 			*) echo "error: compiler '$$compiler' is missing and its apt package is unknown" >&2; exit 2 ;; \
 		esac; \
-		missing_packages="$$missing_packages libncurses-dev"; \
+		missing_packages="$$missing_packages libncurses-dev libcurl4-openssl-dev"; \
 	elif ! printf '%s\n' '#include <ncursesw/ncurses.h>' \
 		'int main(void) { initscr(); endwin(); return 0; }' | \
 		$(CC) -x c - -o /dev/null -lncursesw -lpthread >/dev/null 2>&1; then \
 		missing_packages="$$missing_packages libncurses-dev"; \
+	fi; \
+	if command -v "$$compiler" >/dev/null 2>&1 && \
+		! printf '%s\n' '#include <curl/curl.h>' \
+		'int main(void) { CURL *handle = curl_easy_init(); curl_easy_cleanup(handle); return 0; }' | \
+		$(CC) -x c - -o /dev/null -lcurl >/dev/null 2>&1; then \
+		missing_packages="$$missing_packages libcurl4-openssl-dev"; \
+	fi; \
+	if ! command -v update-ca-certificates >/dev/null 2>&1 && \
+		[ ! -x /usr/sbin/update-ca-certificates ]; then \
+		missing_packages="$$missing_packages ca-certificates"; \
 	fi; \
 	if ! command -v iptables >/dev/null 2>&1 && \
 		[ ! -x /usr/sbin/iptables ] && [ ! -x /sbin/iptables ] && \
@@ -46,7 +57,7 @@ dependencies:
 	echo "Missing apt packages:$$missing_packages"; \
 	if [ "$(AUTO_INSTALL_DEPS)" != "1" ]; then \
 		echo "Automatic installation is disabled (AUTO_INSTALL_DEPS=$(AUTO_INSTALL_DEPS))." >&2; \
-		echo "Install manually: sudo $(APT_GET) update && sudo $(APT_GET) install$$missing_packages" >&2; \
+		echo "Install manually: sudo $(APT_GET) install$$missing_packages" >&2; \
 		exit 2; \
 	fi; \
 	if ! command -v $(APT_GET) >/dev/null 2>&1; then \
@@ -59,12 +70,17 @@ dependencies:
 		elevate='sudo'; \
 	else \
 		echo "error: root privileges are required, but sudo is unavailable" >&2; \
-		echo "Install manually as root: $(APT_GET) update && $(APT_GET) install$$missing_packages" >&2; \
+		echo "Install manually as root: $(APT_GET) install$$missing_packages" >&2; \
 		exit 2; \
 	fi; \
 	echo "Installing missing dependencies..."; \
-	$$elevate $(APT_GET) update; \
-	$$elevate $(APT_GET) install -y $$missing_packages
+	if ! $$elevate $(APT_GET) install -y $$missing_packages; then \
+		echo "Initial installation failed; refreshing apt package indexes..." >&2; \
+		if ! $$elevate $(APT_GET) update; then \
+			echo "warning: apt-get update failed; retrying with the available package indexes." >&2; \
+		fi; \
+		$$elevate $(APT_GET) install -y $$missing_packages; \
+	fi
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -75,8 +91,8 @@ $(BUILD_DIR)/%.o: src/%.c | dependencies $(BUILD_DIR)
 $(TARGET): $(OBJECTS)
 	$(CC) $^ $(LDLIBS) -o $@
 
-$(TEST_TARGET): tests/test_unit.c src/config.c src/socks5.c | dependencies $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+$(TEST_TARGET): tests/test_unit.c src/config.c src/socks5.c src/web_probe.c | dependencies $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(TEST_LDLIBS) -o $@
 
 test: $(TEST_TARGET)
 	$(TEST_TARGET)

@@ -230,6 +230,10 @@ void fp_stats_release(int slot_index);
 void fp_stats_clear_pid(pid_t pid);
 int fp_stats_snapshot(struct fp_stats_snapshot *snapshot);
 
+int fp_web_probe_init(void);
+int fp_web_probe(const char *domain, unsigned short port, int *latency_ms,
+                 atomic_bool *cancel_flag);
+
 int fp_test_run(enum fp_test_mode mode, struct fp_test_report *report,
                 fp_test_event_callback on_event, void *context,
                 atomic_bool *cancel_flag);

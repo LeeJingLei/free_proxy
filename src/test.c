@@ -351,78 +351,24 @@ static int listener_ready(void) {
     return 0;
 }
 
-static enum fp_diagnostic_reason diagnostic_socks_connect(
-    const struct fp_config *config, const struct sockaddr_in *destination,
-    int *error_code, int *detail_code, atomic_bool *cancel_flag);
-
-static int measure_socks_connect_once(const struct fp_config *config,
-                                      const struct sockaddr_in *destination,
-                                      int *latency_ms, atomic_bool *cancel_flag) {
-    enum fp_diagnostic_reason reason;
-    long long start;
-    long long end;
-    int error_code = 0;
-    int detail_code = 0;
-
-    if (cancelled(cancel_flag)) {
-        return -2;
-    }
-    start = now_ms();
-    if (start < 0) {
-        return -1;
-    }
-    reason = diagnostic_socks_connect(config, destination, &error_code, &detail_code,
-                                      cancel_flag);
-    end = now_ms();
-    if (reason != FP_DIAGNOSTIC_REASON_NONE || end < 0) {
-        return cancelled(cancel_flag) ? -2 : -1;
-    }
-    *latency_ms = (int)(end - start);
-    if (*latency_ms < 0) {
-        *latency_ms = 0;
-    }
-    return 0;
+static int measure_web_response_once(const char *domain, unsigned short port,
+                                     int *latency_ms, atomic_bool *cancel_flag) {
+    return fp_web_probe(domain, port, latency_ms, cancel_flag);
 }
 
-static int measure_latency(const struct fp_config *config, const char *domain, unsigned short port,
-                           size_t sample_total, int *latency_ms,
-                           atomic_bool *cancel_flag) {
+static int measure_latency(const char *domain, unsigned short port, size_t sample_total,
+                           int *latency_ms, atomic_bool *cancel_flag) {
     enum { FP_LATENCY_SAMPLE_COUNT = 3 };
-    struct sockaddr_in destination;
-    struct addrinfo *addresses = NULL;
-    struct addrinfo *address;
     int samples[FP_LATENCY_SAMPLE_COUNT];
-    char port_text[8];
     size_t sample;
-    int result = -1;
 
-    if ((sample_total != 1 && sample_total != FP_LATENCY_SAMPLE_COUNT) ||
-        snprintf(port_text, sizeof(port_text), "%u", port) < 0) {
+    if (sample_total != 1 && sample_total != FP_LATENCY_SAMPLE_COUNT) {
         return -1;
     }
-    result = resolve_ipv4(domain, port_text, &addresses, cancel_flag, NULL);
-    if (result != 0 || addresses == NULL) {
-        return cancelled(cancel_flag) ? -2 : -1;
-    }
+    for (sample = 0; sample < sample_total; ++sample) {
+        int result =
+            measure_web_response_once(domain, port, &samples[sample], cancel_flag);
 
-    result = -1;
-    for (address = addresses; address != NULL; address = address->ai_next) {
-        if (address->ai_addrlen < sizeof(destination)) {
-            continue;
-        }
-        memcpy(&destination, address->ai_addr, sizeof(destination));
-        result = measure_socks_connect_once(config, &destination, &samples[0], cancel_flag);
-        if (result == 0 || result == -2) {
-            break;
-        }
-    }
-    freeaddrinfo(addresses);
-    if (result != 0) {
-        return result;
-    }
-
-    for (sample = 1; sample < sample_total; ++sample) {
-        result = measure_socks_connect_once(config, &destination, &samples[sample], cancel_flag);
         if (result != 0) {
             return result;
         }
@@ -616,8 +562,8 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
     return downloaded > 0 ? 0 : -1;
 }
 
-static int run_site_tests(enum fp_test_mode mode, struct fp_config *config,
-                          struct fp_test_report *report, fp_test_event_callback on_event,
+static int run_site_tests(enum fp_test_mode mode, struct fp_test_report *report,
+                          fp_test_event_callback on_event,
                           void *context, atomic_bool *cancel_flag) {
     enum fp_test_phase phase =
         mode == FP_TEST_MODE_LATENCY ? FP_TEST_PHASE_LATENCY : FP_TEST_PHASE_CONNECTIVITY;
@@ -643,10 +589,10 @@ static int run_site_tests(enum fp_test_mode mode, struct fp_config *config,
         (void)snprintf(event.domain, sizeof(event.domain), "%s", report->sites[index].domain);
         emit_event(on_event, context, &event);
 
-        /* Connectivity needs one real CONNECT; latency uses the median of three CONNECTs. */
-        result = measure_latency(config, SITE_TARGETS[index].domain, SITE_TARGETS[index].port,
-                                 mode == FP_TEST_MODE_LATENCY ? 3U : 1U,
-                                 &latency_ms, cancel_flag);
+        /* Every sample waits for a real HTTP(S) response over a fresh transparent connection. */
+        result = measure_latency(SITE_TARGETS[index].domain, SITE_TARGETS[index].port,
+                                 mode == FP_TEST_MODE_LATENCY ? 3U : 1U, &latency_ms,
+                                 cancel_flag);
         if (result == -2 || cancelled(cancel_flag)) {
             report->cancelled = true;
             report->sites[index].state = FP_TEST_SITE_CANCELLED;
@@ -656,13 +602,8 @@ static int run_site_tests(enum fp_test_mode mode, struct fp_config *config,
             report->sites[index].state = FP_TEST_SITE_OK;
             ++report->sites_passed;
             event.state = FP_TEST_SITE_OK;
-            if (mode == FP_TEST_MODE_LATENCY) {
-                report->sites[index].latency_ms = latency_ms;
-                event.latency_ms = latency_ms;
-            } else {
-                report->sites[index].latency_ms = -1;
-                event.latency_ms = -1;
-            }
+            report->sites[index].latency_ms = latency_ms;
+            event.latency_ms = latency_ms;
         } else {
             report->sites[index].state = FP_TEST_SITE_FAIL;
             append_failed(report, report->sites[index].domain);
@@ -1154,7 +1095,7 @@ int fp_test_run(enum fp_test_mode mode, struct fp_test_report *report,
         (void)run_speed_tests(&config, report, on_event, context, cancel_flag);
         ok = !report->cancelled && report->speed_passed == report->speed_count;
     } else {
-        (void)run_site_tests(mode, &config, report, on_event, context, cancel_flag);
+        (void)run_site_tests(mode, report, on_event, context, cancel_flag);
         ok = !report->cancelled && report->sites_passed == report->site_count;
     }
 

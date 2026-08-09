@@ -40,7 +40,7 @@ make
 sudo make install
 ```
 
-`make` checks for a compiler, the `ncursesw` development library, and `iptables`,
+`make` checks for a compiler, the `ncursesw` and `libcurl` development libraries, TLS root certificates, and `iptables`,
 then installs missing packages automatically with `sudo apt-get`. GNU make itself
 must already be installed. To check without automatic installation, run
 `make AUTO_INSTALL_DEPS=0`.
@@ -90,7 +90,7 @@ Press `m` to open the traffic monitor. While the forwarder is running it shows l
 
 Press `c` to run a read-only connection diagnosis. It stops at the first failed stage and reports whether the problem is the saved configuration, forwarder, local listener, iptables rules, proxy TCP port, SOCKS5 protocol/authentication, local DNS, proxy outbound connection, or transparent forwarding path.
 
-Press `t` to open the network test page, then choose `1` connectivity, `2` SOCKS5 connect latency, or `3` download speed. Connectivity completes one real SOCKS5 CONNECT. Latency excludes local DNS and reports the median of three full proxy TCP, SOCKS5 handshake, and target CONNECT attempts per site. Speed downloads up to 10 MiB and shows live Mbps while running. Press `q` to cancel a running test or leave the menu.
+Press `t` to open the network test page, then choose `1` connectivity, `2` end-to-end response latency, or `3` download speed. Connectivity opens a fresh connection through `free_proxy`, performs a real HTTP(S) request, and requires a valid HTTP response. Latency runs the same request three times per site and reports the median time from request start to the first HTTP response byte, including DNS, TCP, transparent forwarding, SOCKS5, TLS for HTTPS, and server response time. Connectivity and response-latency results appear as soon as each target finishes, followed by a summary after all targets complete. Speed downloads up to 10 MiB and shows live Mbps while running. Press `q` to cancel a running test or leave the menu.
 
 ## Command-line usage
 
