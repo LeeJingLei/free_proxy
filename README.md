@@ -17,6 +17,12 @@ Start a SOCKS5 service on the host and make it reachable from the VM.
 - Use the host IP visible from the VM. In NAT mode, this is often the VM's default gateway.
 - This version supports an IPv4 SOCKS5 server without username/password authentication.
 
+Windows host example:
+
+1. Open Command Prompt and run `ipconfig`. Find a host IPv4 address that the VM can reach—not the VM's own address.
+2. Open the host proxy app, note its SOCKS5 port, and enable **Allow LAN**.
+3. Record the address as `HOST_IP:SOCKS5_PORT`, for example `192.168.3.2:10808`, for use during configuration.
+
 Before installing `free_proxy`, verify that the VM can reach the proxy directly:
 
 ```sh
