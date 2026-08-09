@@ -30,11 +30,14 @@ Replace `192.168.3.2:10808` with the host SOCKS5 address and port.
 On Ubuntu or Debian:
 
 ```sh
-sudo apt update
-sudo apt install build-essential libncurses-dev iptables
 make
 sudo make install
 ```
+
+`make` checks for a compiler, the `ncursesw` development library, and `iptables`,
+then installs missing packages automatically with `sudo apt-get`. GNU make itself
+must already be installed. To check without automatic installation, run
+`make AUTO_INSTALL_DEPS=0`.
 
 The installed command is `/usr/local/bin/free_proxy`.
 

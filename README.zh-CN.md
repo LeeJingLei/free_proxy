@@ -30,11 +30,13 @@ curl --socks5-hostname 192.168.3.2:10808 https://api.ipify.org
 在 Ubuntu 或 Debian 上执行：
 
 ```sh
-sudo apt update
-sudo apt install build-essential libncurses-dev iptables
 make
 sudo make install
 ```
+
+`make` 会检查编译器、`ncursesw` 开发库和 `iptables`；发现缺失项时，会通过
+`sudo apt-get` 自动安装。系统仍需预先装有 GNU make。若只想检查而不自动安装，
+可执行 `make AUTO_INSTALL_DEPS=0`。
 
 安装后的命令为 `/usr/local/bin/free_proxy`。
 
