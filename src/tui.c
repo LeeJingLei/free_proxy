@@ -18,6 +18,31 @@
 #define MIN_COLS 66
 #define LABEL_WIDTH 18
 
+#define MON_ARROW_WIDTH 2
+#define MON_COL_AFTER_ARROW(arrow_col) ((arrow_col) + MON_ARROW_WIDTH + 1)
+
+#define MON_SUMMARY_LABEL_COL 4
+#define MON_SUMMARY_LABEL_WIDTH 8
+#define MON_SUMMARY_UP_ARROW_COL 14
+#define MON_SUMMARY_UP_COL MON_COL_AFTER_ARROW(MON_SUMMARY_UP_ARROW_COL)
+#define MON_SUMMARY_UP_WIDTH 11
+#define MON_SUMMARY_DOWN_ARROW_COL 28
+#define MON_SUMMARY_DOWN_COL MON_COL_AFTER_ARROW(MON_SUMMARY_DOWN_ARROW_COL)
+#define MON_SUMMARY_DOWN_WIDTH 11
+#define MON_SUMMARY_AGE_COL 43
+#define MON_SUMMARY_AGE_WIDTH 12
+
+#define MON_DEST_COL 4
+#define MON_DEST_WIDTH 24
+#define MON_LIST_UP_ARROW_COL 28
+#define MON_LIST_UP_COL MON_COL_AFTER_ARROW(MON_LIST_UP_ARROW_COL)
+#define MON_LIST_UP_WIDTH 11
+#define MON_LIST_DOWN_ARROW_COL 42
+#define MON_LIST_DOWN_COL MON_COL_AFTER_ARROW(MON_LIST_DOWN_ARROW_COL)
+#define MON_LIST_DOWN_WIDTH 11
+#define MON_LIST_AGE_COL 57
+#define MON_LIST_AGE_WIDTH 8
+
 struct ui_text {
     const char *title;
     const char *terminal_small;
@@ -151,6 +176,42 @@ static int utf8_display_width(const char *text) {
         cursor += consumed;
     }
     return width;
+}
+
+static void draw_text_field(int row, int column, int width, const char *text) {
+    int used = 0;
+    int col;
+
+    for (col = 0; col < width; ++col) {
+        mvaddch(row, column + col, ' ');
+    }
+    if (text != NULL && text[0] != '\0') {
+        mvprintw(row, column, "%s", text);
+        used = utf8_display_width(text);
+        if (used > width) {
+            return;
+        }
+    }
+}
+
+static void draw_arrow(int row, int column, int up) {
+    wchar_t codepoint = up ? (wchar_t)0x2191 : (wchar_t)0x2193;
+    cchar_t glyph;
+    int col;
+
+    /*
+     * CJK/UTF-8 terminals often render ↑/↓ as two columns while byte-oriented
+     * mvprintw() only skips one. Use ncurses wide-char output on even columns
+     * and keep the full MON_ARROW_WIDTH slot clear of other text.
+     */
+    for (col = 0; col < MON_ARROW_WIDTH; ++col) {
+        mvaddch(row, column + col, ' ');
+    }
+    if (setcchar(&glyph, &codepoint, A_NORMAL, 0, NULL) == OK &&
+        mvwadd_wch(stdscr, row, column, &glyph) == OK) {
+        return;
+    }
+    mvprintw(row, column, "%s", up ? "↑" : "↓");
 }
 
 static void draw_line(int row, const char *label, const char *value, int active) {
@@ -432,27 +493,36 @@ static void draw_test_progress(enum fp_ui_language language, enum fp_test_mode m
                            event->index, event->total, event->name);
         }
     } else if (event->phase == FP_TEST_PHASE_SPEED) {
+        char speed_text[32];
+        char downloaded_text[32];
+        char max_text[32];
+
+        fp_format_bytes(max_text, sizeof(max_text), FP_TEST_SPEED_MAX_BYTES);
         if (event->state == FP_TEST_SITE_RUNNING) {
+            fp_format_rate(speed_text, sizeof(speed_text), event->speed_bps);
+            fp_format_bytes(downloaded_text, sizeof(downloaded_text), event->bytes_downloaded);
             (void)snprintf(line, sizeof(line),
                            language == FP_UI_LANGUAGE_ZH ?
-                               "测速 %zu/%zu：%s（最多 10 MiB）" :
-                               "Speed %zu/%zu: %s (up to 10 MiB)",
-                           event->index, event->total, event->name);
+                               "测速 %zu/%zu：%s（最多 %s）" :
+                               "Speed %zu/%zu: %s (up to %s)",
+                           event->index, event->total, event->name, max_text);
             (void)snprintf(detail, sizeof(detail),
                            language == FP_UI_LANGUAGE_ZH ?
-                               "实时速度：%.2f Mbps    已下载：%zu / %u bytes" :
-                               "Live speed: %.2f Mbps    Downloaded: %zu / %u bytes",
-                           event->speed_mbps, event->bytes_downloaded, FP_TEST_SPEED_MAX_BYTES);
+                               "实时速度：%-11s  已下载：%s / %s" :
+                               "Live speed: %-11s  downloaded: %s / %s",
+                           speed_text, downloaded_text, max_text);
         } else if (event->state == FP_TEST_SITE_OK) {
+            fp_format_rate(speed_text, sizeof(speed_text), event->speed_bps);
+            fp_format_bytes(downloaded_text, sizeof(downloaded_text), event->bytes_downloaded);
             (void)snprintf(line, sizeof(line),
                            language == FP_UI_LANGUAGE_ZH ?
-                               "测速 %zu/%zu：%s  完成 %.2f Mbps" :
-                               "Speed %zu/%zu: %s  done %.2f Mbps",
-                           event->index, event->total, event->name, event->speed_mbps);
+                               "测速 %zu/%zu：%s  完成 %s" :
+                               "Speed %zu/%zu: %s  done %s",
+                           event->index, event->total, event->name, speed_text);
             (void)snprintf(detail, sizeof(detail),
-                           language == FP_UI_LANGUAGE_ZH ? "下载量：%zu bytes" :
-                                                           "Downloaded: %zu bytes",
-                           event->bytes_downloaded);
+                           language == FP_UI_LANGUAGE_ZH ? "下载量：%s" :
+                                                           "Downloaded: %s",
+                           downloaded_text);
         } else {
             (void)snprintf(line, sizeof(line),
                            language == FP_UI_LANGUAGE_ZH ? "测速 %zu/%zu：%s  失败" :
@@ -542,21 +612,29 @@ static void draw_test_results(enum fp_ui_language language, const struct fp_test
                 }
             }
         } else {
+            char peak_speed[32];
+
+            fp_format_rate(peak_speed, sizeof(peak_speed), report->best_speed_bps);
             mvprintw(row++, 4,
                      language == FP_UI_LANGUAGE_ZH ?
-                         "测速：%zu/%zu 成功，峰值 %.2f Mbps" :
-                         "Speed: %zu/%zu passed, peak %.2f Mbps",
-                     report->speed_passed, report->speed_count, report->best_speed_mbps);
+                         "测速：%zu/%zu 成功，峰值 %s" :
+                         "Speed: %zu/%zu passed, peak %s",
+                     report->speed_passed, report->speed_count, peak_speed);
             for (index = 0; index < report->speed_count && row < LINES - 5; ++index) {
                 const struct fp_test_site_result *item = &report->speed[index];
                 const char *mark = item->state == FP_TEST_SITE_OK        ? "OK" :
                                    item->state == FP_TEST_SITE_FAIL      ? "FAIL" :
                                    item->state == FP_TEST_SITE_CANCELLED ? "SKIP" :
                                                                           "...";
+                char speed_text[32];
+                char downloaded_text[32];
 
                 if (item->state == FP_TEST_SITE_OK) {
-                    mvprintw(row++, 6, "%-4s %-18s %6.2f Mbps  (%zu bytes)", mark, item->name,
-                             item->speed_mbps, item->bytes_downloaded);
+                    fp_format_rate(speed_text, sizeof(speed_text), item->speed_bps);
+                    fp_format_bytes(downloaded_text, sizeof(downloaded_text),
+                                    item->bytes_downloaded);
+                    mvprintw(row++, 6, "%-4s %-18s %-11s  %s", mark, item->name, speed_text,
+                             downloaded_text);
                 } else if (item->state != FP_TEST_SITE_PENDING) {
                     mvprintw(row++, 6, "%-4s %-18s", mark, item->name);
                 }
@@ -671,11 +749,14 @@ static void run_selected_test(enum fp_ui_language language, enum fp_test_mode mo
         (void)snprintf(message, message_size,
                        language == FP_UI_LANGUAGE_ZH ? "测试已取消。" : "Test cancelled.");
     } else if (mode == FP_TEST_MODE_SPEED) {
+        char peak_speed[32];
+
+        fp_format_rate(peak_speed, sizeof(peak_speed), report.best_speed_bps);
         (void)snprintf(message, message_size,
                        language == FP_UI_LANGUAGE_ZH ?
-                           "测速完成：%zu/%zu，峰值 %.2f Mbps。" :
-                           "Speed test done: %zu/%zu, peak %.2f Mbps.",
-                       report.speed_passed, report.speed_count, report.best_speed_mbps);
+                           "测速完成：%zu/%zu，峰值 %s。" :
+                           "Speed test done: %zu/%zu, peak %s.",
+                       report.speed_passed, report.speed_count, peak_speed);
     } else if (mode == FP_TEST_MODE_LATENCY) {
         (void)snprintf(message, message_size,
                        language == FP_UI_LANGUAGE_ZH ? "端到端响应延迟测试完成：%zu/%zu。" :
@@ -1059,26 +1140,6 @@ static void run_diagnostic_page(enum fp_ui_language language, char *message, siz
     timeout(1000);
 }
 
-static void format_bytes(char *buffer, size_t buffer_size, uint64_t bytes) {
-    if (bytes >= 1024ull * 1024ull * 1024ull) {
-        (void)snprintf(buffer, buffer_size, "%.2f GiB",
-                       (double)bytes / (1024.0 * 1024.0 * 1024.0));
-    } else if (bytes >= 1024ull * 1024ull) {
-        (void)snprintf(buffer, buffer_size, "%.2f MiB", (double)bytes / (1024.0 * 1024.0));
-    } else if (bytes >= 1024ull) {
-        (void)snprintf(buffer, buffer_size, "%.1f KiB", (double)bytes / 1024.0);
-    } else {
-        (void)snprintf(buffer, buffer_size, "%llu B", (unsigned long long)bytes);
-    }
-}
-
-static void format_rate(char *buffer, size_t buffer_size, double mbps) {
-    if (mbps < 0.0) {
-        mbps = 0.0;
-    }
-    (void)snprintf(buffer, buffer_size, "%.2f Mbps", mbps);
-}
-
 static void format_duration(char *buffer, size_t buffer_size, uint64_t age_ms) {
     uint64_t seconds = age_ms / 1000ull;
     uint64_t minutes = seconds / 60ull;
@@ -1100,8 +1161,8 @@ struct monitor_rate_state {
     uint64_t anchor_up;
     uint64_t anchor_down;
     struct timespec anchor_time;
-    double up_mbps;
-    double down_mbps;
+    double up_bps;
+    double down_bps;
     int has_anchor;
 };
 
@@ -1125,8 +1186,8 @@ static void update_monitor_rates(struct monitor_rate_state *state, uint64_t tota
         state->anchor_up = total_up;
         state->anchor_down = total_down;
         state->anchor_time = *now;
-        state->up_mbps = 0.0;
-        state->down_mbps = 0.0;
+        state->up_bps = 0.0;
+        state->down_bps = 0.0;
         state->has_anchor = 1;
         return;
     }
@@ -1136,8 +1197,8 @@ static void update_monitor_rates(struct monitor_rate_state *state, uint64_t tota
         return;
     }
 
-    state->up_mbps = ((double)(total_up - state->anchor_up) * 8.0) / (elapsed_ms * 1000.0);
-    state->down_mbps = ((double)(total_down - state->anchor_down) * 8.0) / (elapsed_ms * 1000.0);
+    state->up_bps = (double)(total_up - state->anchor_up) * 1000.0 / elapsed_ms;
+    state->down_bps = (double)(total_down - state->anchor_down) * 1000.0 / elapsed_ms;
 
     if (elapsed_ms >= 1000.0) {
         state->anchor_up = total_up;
@@ -1147,7 +1208,7 @@ static void update_monitor_rates(struct monitor_rate_state *state, uint64_t tota
 }
 
 static void draw_monitor_page(enum fp_ui_language language, const struct fp_stats_snapshot *snapshot,
-                              double up_mbps, double down_mbps, int daemon_running,
+                              double up_bps, double down_bps, int daemon_running,
                               const char *status_line, int testing) {
     const char *title = language == FP_UI_LANGUAGE_ZH ? "流量与连接监控" : "Traffic monitor";
     const char *hint = testing ?
@@ -1161,6 +1222,7 @@ static void draw_monitor_page(enum fp_ui_language language, const struct fp_stat
     char total_up[32];
     char total_down[32];
     char uptime[32];
+    char uptime_line[40];
     int row = 8;
     int list_bottom = LINES - 3;
     size_t index;
@@ -1170,10 +1232,10 @@ static void draw_monitor_page(enum fp_ui_language language, const struct fp_stat
         list_bottom = LINES - 4;
     }
 
-    format_rate(up_rate, sizeof(up_rate), up_mbps);
-    format_rate(down_rate, sizeof(down_rate), down_mbps);
-    format_bytes(total_up, sizeof(total_up), snapshot->available ? snapshot->total_up : 0);
-    format_bytes(total_down, sizeof(total_down), snapshot->available ? snapshot->total_down : 0);
+    fp_format_rate(up_rate, sizeof(up_rate), up_bps);
+    fp_format_rate(down_rate, sizeof(down_rate), down_bps);
+    fp_format_bytes(total_up, sizeof(total_up), snapshot->available ? snapshot->total_up : 0);
+    fp_format_bytes(total_down, sizeof(total_down), snapshot->available ? snapshot->total_down : 0);
     format_duration(uptime, sizeof(uptime), snapshot->available ? snapshot->uptime_ms : 0);
 
     erase();
@@ -1188,24 +1250,42 @@ static void draw_monitor_page(enum fp_ui_language language, const struct fp_stat
                      "转发服务未运行，暂无流量统计。" :
                      "Forwarder is not running; no live stats.");
     } else {
-        mvprintw(3, 4,
-                 language == FP_UI_LANGUAGE_ZH ?
-                     "实时   ↑  %s      ↓  %s" :
-                     "Live    ↑  %s      ↓  %s",
-                 up_rate, down_rate);
-        mvprintw(4, 4,
-                 language == FP_UI_LANGUAGE_ZH ?
-                     "累计   ↑  %s      ↓  %s      运行 %s" :
-                     "Total   ↑  %s      ↓  %s      up %s",
-                 total_up, total_down, uptime);
+        const char *dest_heading =
+            language == FP_UI_LANGUAGE_ZH ? "目标" : "Destination";
+        const char *traffic_heading =
+            language == FP_UI_LANGUAGE_ZH ? "流量" : "traffic";
+        const char *age_heading =
+            language == FP_UI_LANGUAGE_ZH ? "时长" : "age";
+        const char *live_label =
+            language == FP_UI_LANGUAGE_ZH ? "实时" : "Live";
+        const char *total_label =
+            language == FP_UI_LANGUAGE_ZH ? "累计" : "Total";
+
+        draw_text_field(3, MON_SUMMARY_LABEL_COL, MON_SUMMARY_LABEL_WIDTH, live_label);
+        draw_arrow(3, MON_SUMMARY_UP_ARROW_COL, 1);
+        draw_text_field(3, MON_SUMMARY_UP_COL, MON_SUMMARY_UP_WIDTH, up_rate);
+        draw_arrow(3, MON_SUMMARY_DOWN_ARROW_COL, 0);
+        draw_text_field(3, MON_SUMMARY_DOWN_COL, MON_SUMMARY_DOWN_WIDTH, down_rate);
+
+        draw_text_field(4, MON_SUMMARY_LABEL_COL, MON_SUMMARY_LABEL_WIDTH, total_label);
+        draw_arrow(4, MON_SUMMARY_UP_ARROW_COL, 1);
+        draw_text_field(4, MON_SUMMARY_UP_COL, MON_SUMMARY_UP_WIDTH, total_up);
+        draw_arrow(4, MON_SUMMARY_DOWN_ARROW_COL, 0);
+        draw_text_field(4, MON_SUMMARY_DOWN_COL, MON_SUMMARY_DOWN_WIDTH, total_down);
+        (void)snprintf(uptime_line, sizeof(uptime_line),
+                       language == FP_UI_LANGUAGE_ZH ? "运行 %s" : "up %s", uptime);
+        draw_text_field(4, MON_SUMMARY_AGE_COL, MON_SUMMARY_AGE_WIDTH, uptime_line);
+
         mvprintw(5, 4,
                  language == FP_UI_LANGUAGE_ZH ? "活跃连接：%zu" : "Active connections: %zu",
                  snapshot->conn_count);
         mvhline(6, 2, '-', COLS - 4);
-        mvprintw(7, 4,
-                 language == FP_UI_LANGUAGE_ZH ?
-                     "目标                      ↑  流量      ↓  流量     时长" :
-                     "Destination               ↑  bytes     ↓  bytes    age");
+        draw_text_field(7, MON_DEST_COL, MON_DEST_WIDTH, dest_heading);
+        draw_arrow(7, MON_LIST_UP_ARROW_COL, 1);
+        draw_text_field(7, MON_LIST_UP_COL, MON_LIST_UP_WIDTH, traffic_heading);
+        draw_arrow(7, MON_LIST_DOWN_ARROW_COL, 0);
+        draw_text_field(7, MON_LIST_DOWN_COL, MON_LIST_DOWN_WIDTH, traffic_heading);
+        draw_text_field(7, MON_LIST_AGE_COL, MON_LIST_AGE_WIDTH, age_heading);
         for (index = 0; index < snapshot->conn_count && row < list_bottom; ++index) {
             const struct fp_stats_conn_view *conn = &snapshot->connections[index];
             char address[INET_ADDRSTRLEN];
@@ -1218,10 +1298,16 @@ static void draw_monitor_page(enum fp_ui_language language, const struct fp_stat
                 continue;
             }
             (void)snprintf(dest, sizeof(dest), "%s:%u", address, conn->dest_port);
-            format_bytes(up_bytes, sizeof(up_bytes), conn->bytes_up);
-            format_bytes(down_bytes, sizeof(down_bytes), conn->bytes_down);
+            fp_format_bytes(up_bytes, sizeof(up_bytes), conn->bytes_up);
+            fp_format_bytes(down_bytes, sizeof(down_bytes), conn->bytes_down);
             format_duration(age, sizeof(age), conn->age_ms);
-            mvprintw(row++, 4, "%-24s %10s %10s %7s", dest, up_bytes, down_bytes, age);
+            draw_text_field(row, MON_DEST_COL, MON_DEST_WIDTH, dest);
+            draw_arrow(row, MON_LIST_UP_ARROW_COL, 1);
+            draw_text_field(row, MON_LIST_UP_COL, MON_LIST_UP_WIDTH, up_bytes);
+            draw_arrow(row, MON_LIST_DOWN_ARROW_COL, 0);
+            draw_text_field(row, MON_LIST_DOWN_COL, MON_LIST_DOWN_WIDTH, down_bytes);
+            draw_text_field(row, MON_LIST_AGE_COL, MON_LIST_AGE_WIDTH, age);
+            ++row;
             ++shown;
         }
         if (shown == 0) {
@@ -1254,11 +1340,14 @@ static void format_monitor_test_result(enum fp_ui_language language, enum fp_tes
         (void)snprintf(message, message_size,
                        language == FP_UI_LANGUAGE_ZH ? "测试已取消。" : "Test cancelled.");
     } else if (mode == FP_TEST_MODE_SPEED) {
+        char peak_speed[32];
+
+        fp_format_rate(peak_speed, sizeof(peak_speed), report->best_speed_bps);
         (void)snprintf(message, message_size,
                        language == FP_UI_LANGUAGE_ZH ?
-                           "测速结果：%zu/%zu，峰值 %.2f Mbps。" :
-                           "Speed result: %zu/%zu, peak %.2f Mbps.",
-                       report->speed_passed, report->speed_count, report->best_speed_mbps);
+                           "测速结果：%zu/%zu，峰值 %s。" :
+                           "Speed result: %zu/%zu, peak %s.",
+                       report->speed_passed, report->speed_count, peak_speed);
     } else if (mode == FP_TEST_MODE_LATENCY) {
         (void)snprintf(message, message_size,
                        language == FP_UI_LANGUAGE_ZH ? "响应延迟结果：%zu/%zu 成功。" :
@@ -1341,12 +1430,15 @@ static void run_monitor_test(enum fp_ui_language language, enum fp_test_mode mod
                 if (event.phase == FP_TEST_PHASE_DONE) {
                     finished = 1;
                 } else if (event.phase == FP_TEST_PHASE_SPEED &&
-                           event.state == FP_TEST_SITE_RUNNING && event.speed_mbps > 0.0) {
+                           event.state == FP_TEST_SITE_RUNNING && event.speed_bps > 0.0) {
+                    char speed_text[32];
+
+                    fp_format_rate(speed_text, sizeof(speed_text), event.speed_bps);
                     (void)snprintf(status_line, status_size,
                                    language == FP_UI_LANGUAGE_ZH ?
-                                       "测速中 %zu/%zu：%s  %.2f Mbps" :
-                                       "Speed %zu/%zu: %s  %.2f Mbps",
-                                   event.index, event.total, event.name, event.speed_mbps);
+                                       "测速中 %zu/%zu：%s  %s" :
+                                       "Speed %zu/%zu: %s  %s",
+                                   event.index, event.total, event.name, speed_text);
                 } else if (event.name[0] != '\0' && event.phase != FP_TEST_PHASE_PREFLIGHT) {
                     (void)snprintf(status_line, status_size,
                                    language == FP_UI_LANGUAGE_ZH ? "测试中 %zu/%zu：%s" :
@@ -1360,7 +1452,7 @@ static void run_monitor_test(enum fp_ui_language language, enum fp_test_mode mod
             finished = 1;
         }
 
-        draw_monitor_page(language, &snapshot, rates->up_mbps, rates->down_mbps,
+        draw_monitor_page(language, &snapshot, rates->up_bps, rates->down_bps,
                           status.daemon_running, status_line, 1);
     }
     nodelay(stdscr, FALSE);
@@ -1401,7 +1493,7 @@ static void run_monitor_page(enum fp_ui_language language, char *message, size_t
         } else {
             memset(&rates, 0, sizeof(rates));
         }
-        draw_monitor_page(language, &snapshot, rates.up_mbps, rates.down_mbps, status.daemon_running,
+        draw_monitor_page(language, &snapshot, rates.up_bps, rates.down_bps, status.daemon_running,
                           status_line, 0);
 
         key = getch();

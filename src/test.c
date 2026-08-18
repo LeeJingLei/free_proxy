@@ -453,7 +453,7 @@ static int skip_http_headers(int socket_fd, unsigned char *buffer, size_t capaci
 }
 
 static int measure_speed(const struct fp_config *config, const struct speed_target *target,
-                         size_t index, size_t total, size_t *bytes_downloaded, double *speed_mbps,
+                         size_t index, size_t total, size_t *bytes_downloaded, double *speed_bps,
                          fp_test_event_callback on_event, void *context,
                          atomic_bool *cancel_flag) {
     char request[256];
@@ -470,7 +470,7 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
     int written;
 
     *bytes_downloaded = 0;
-    *speed_mbps = 0.0;
+    *speed_bps = 0.0;
     (void)config;
     if (cancelled(cancel_flag)) {
         return -2;
@@ -544,10 +544,10 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
             double live = 0.0;
 
             if (now > start) {
-                live = ((double)downloaded * 8.0) / ((double)(now - start) * 1000.0);
+                live = (double)downloaded * 1000.0 / (double)(now - start);
             }
             event.bytes_downloaded = downloaded;
-            event.speed_mbps = live;
+            event.speed_bps = live;
             emit_event(on_event, context, &event);
             last_emit = now;
         }
@@ -558,7 +558,7 @@ static int measure_speed(const struct fp_config *config, const struct speed_targ
     if (end <= start || downloaded == 0) {
         return -1;
     }
-    *speed_mbps = ((double)downloaded * 8.0) / ((double)(end - start) * 1000.0);
+    *speed_bps = (double)downloaded * 1000.0 / (double)(end - start);
     return downloaded > 0 ? 0 : -1;
 }
 
@@ -623,7 +623,7 @@ static int run_speed_tests(struct fp_config *config, struct fp_test_report *repo
     for (index = 0; index < report->speed_count; ++index) {
         struct fp_test_progress_event event;
         size_t bytes = 0;
-        double mbps = 0.0;
+        double speed_bps = 0.0;
         int result;
 
         if (cancelled(cancel_flag)) {
@@ -642,21 +642,21 @@ static int run_speed_tests(struct fp_config *config, struct fp_test_report *repo
         emit_event(on_event, context, &event);
 
         result = measure_speed(config, &SPEED_TARGETS[index], index + 1, report->speed_count, &bytes,
-                               &mbps, on_event, context, cancel_flag);
+                               &speed_bps, on_event, context, cancel_flag);
         if (result == -2 || cancelled(cancel_flag)) {
             report->cancelled = true;
             report->speed[index].state = FP_TEST_SITE_CANCELLED;
             report->speed[index].bytes_downloaded = bytes;
-            report->speed[index].speed_mbps = mbps;
+            report->speed[index].speed_bps = speed_bps;
             return -1;
         }
         report->speed[index].bytes_downloaded = bytes;
-        report->speed[index].speed_mbps = mbps;
+        report->speed[index].speed_bps = speed_bps;
         if (result == 0) {
             report->speed[index].state = FP_TEST_SITE_OK;
             ++report->speed_passed;
-            if (mbps > report->best_speed_mbps) {
-                report->best_speed_mbps = mbps;
+            if (speed_bps > report->best_speed_bps) {
+                report->best_speed_bps = speed_bps;
             }
             event.state = FP_TEST_SITE_OK;
         } else {
@@ -665,7 +665,7 @@ static int run_speed_tests(struct fp_config *config, struct fp_test_report *repo
             event.state = FP_TEST_SITE_FAIL;
         }
         event.bytes_downloaded = bytes;
-        event.speed_mbps = mbps;
+        event.speed_bps = speed_bps;
         emit_event(on_event, context, &event);
     }
     return 0;

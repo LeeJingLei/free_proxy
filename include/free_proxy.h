@@ -80,7 +80,7 @@ struct fp_test_site_result {
     char domain[64];
     enum fp_test_site_state state;
     int latency_ms;
-    double speed_mbps;
+    double speed_bps;
     size_t bytes_downloaded;
 };
 
@@ -94,7 +94,7 @@ struct fp_test_report {
     struct fp_test_site_result speed[FP_TEST_MAX_SPEED];
     size_t speed_count;
     size_t speed_passed;
-    double best_speed_mbps;
+    double best_speed_bps;
     char failures[FP_TEST_FAILURES_SIZE];
 };
 
@@ -104,7 +104,7 @@ struct fp_test_progress_event {
     size_t total;
     enum fp_test_site_state state;
     int latency_ms;
-    double speed_mbps;
+    double speed_bps;
     size_t bytes_downloaded;
     char name[32];
     char domain[64];
@@ -252,5 +252,8 @@ int fp_disable_proxy(void);
 int fp_uninstall(void);
 void fp_collect_status(struct fp_status *status);
 int fp_tui_run(void);
+
+void fp_format_bytes(char *buffer, size_t buffer_size, uint64_t bytes);
+void fp_format_rate(char *buffer, size_t buffer_size, double bytes_per_sec);
 
 #endif
