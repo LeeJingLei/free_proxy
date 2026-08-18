@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <locale.h>
 #include <netdb.h>
 #include <ncursesw/ncurses.h>
@@ -11,9 +12,11 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
 #define MIN_ROWS 24
 #define MIN_COLS 66
+#define LABEL_WIDTH 18
 
 struct ui_text {
     const char *title;
@@ -122,16 +125,51 @@ static const struct ui_text UI_TEXT[] = {
          "Unable to save language setting."},
 };
 
+static int utf8_display_width(const char *text) {
+    mbstate_t state;
+    const unsigned char *cursor;
+    int width = 0;
+
+    if (text == NULL) {
+        return 0;
+    }
+    memset(&state, 0, sizeof(state));
+    cursor = (const unsigned char *)text;
+    while (*cursor != '\0') {
+        wchar_t codepoint;
+        size_t consumed = mbrtowc(&codepoint, (const char *)cursor, MB_LEN_MAX, &state);
+        int glyph_width;
+
+        if (consumed == 0) {
+            break;
+        }
+        if (consumed == (size_t)-1 || consumed == (size_t)-2) {
+            return width;
+        }
+        glyph_width = wcwidth(codepoint);
+        width += glyph_width >= 0 ? glyph_width : 0;
+        cursor += consumed;
+    }
+    return width;
+}
+
 static void draw_line(int row, const char *label, const char *value, int active) {
+    int column = 4;
+    int label_end = column + LABEL_WIDTH;
+
     attron(A_BOLD);
-    mvprintw(row, 4, "%-18s", label);
+    mvprintw(row, column, "%s", label);
     attroff(A_BOLD);
+    column += utf8_display_width(label);
+    while (column < label_end) {
+        mvaddch(row, column++, ' ');
+    }
     if (active) {
         attron(COLOR_PAIR(1) | A_BOLD);
     } else {
         attron(COLOR_PAIR(2));
     }
-    printw("%s", value);
+    mvprintw(row, column, "%s", value);
     if (active) {
         attroff(COLOR_PAIR(1) | A_BOLD);
     } else {
