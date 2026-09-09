@@ -39,6 +39,10 @@ int fp_enable_proxy(const char *proxy) {
         return -1;
     }
     had_previous_config = fp_config_load(&previous_config) == 0;
+    if (had_previous_config) {
+        config.bypass_count = previous_config.bypass_count;
+        memcpy(config.bypass, previous_config.bypass, sizeof(config.bypass));
+    }
     was_running = fp_read_pid() > 1;
     if (fp_config_save(&config) != 0) {
         fp_lock_release(lock_fd);
@@ -65,6 +69,34 @@ int fp_enable_saved_proxy(void) {
         return -1;
     }
     result = activate_proxy_locked(&config);
+    fp_lock_release(lock_fd);
+    return result;
+}
+
+int fp_set_bypass(const char *bypass_list) {
+    struct fp_config config;
+    struct fp_config previous_config;
+    int lock_fd = fp_lock_acquire();
+    bool was_running;
+    int result = 0;
+
+    if (lock_fd < 0 || fp_config_load(&config) != 0) {
+        fp_lock_release(lock_fd);
+        return -1;
+    }
+    previous_config = config;
+    if (fp_parse_bypass_list(bypass_list, &config) != 0) {
+        fp_lock_release(lock_fd);
+        return -1;
+    }
+    was_running = fp_read_pid() > 1;
+    if (fp_config_save(&config) != 0 || (was_running && fp_firewall_enable(&config) != 0)) {
+        result = -1;
+        (void)fp_config_save(&previous_config);
+        if (was_running) {
+            (void)fp_firewall_enable(&previous_config);
+        }
+    }
     fp_lock_release(lock_fd);
     return result;
 }
@@ -135,5 +167,15 @@ void fp_collect_status(struct fp_status *status) {
                               config.proxy_port);
         status->config_valid = length > 0 && (size_t)length < available;
         status->firewall_enabled = fp_firewall_is_enabled(&config);
+        if (config.bypass_count == 0) {
+            (void)snprintf(status->bypass, sizeof(status->bypass), "none");
+        } else {
+            for (size_t index = 0; index < config.bypass_count; ++index) {
+                size_t bypass_used = strlen(status->bypass);
+                (void)snprintf(status->bypass + bypass_used,
+                               sizeof(status->bypass) - bypass_used, "%s%s",
+                               index == 0 ? "" : ",", config.bypass[index].text);
+            }
+        }
     }
 }

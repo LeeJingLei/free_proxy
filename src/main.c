@@ -12,11 +12,14 @@ static void print_usage(const char *program_name) {
             "Usage:\n"
             "  %s\n"
             "  %s enable --proxy IPv4:PORT\n"
+            "  %s bypass --set IPv4_OR_CIDR[,IPv4_OR_CIDR...]\n"
+            "  %s bypass --clear\n"
             "  %s disable\n"
             "  %s status\n"
             "  %s autostart enable|disable\n"
             "  %s uninstall --yes\n",
-            program_name, program_name, program_name, program_name, program_name, program_name);
+            program_name, program_name, program_name, program_name, program_name, program_name,
+            program_name, program_name);
 }
 
 static int require_root(void) {
@@ -38,6 +41,7 @@ static void print_status(void) {
     }
     putchar('\n');
     printf("iptables: %s\n", status.firewall_enabled ? "enabled" : "disabled");
+    printf("bypass: %s\n", status.config_valid ? status.bypass : "unavailable");
     printf("autostart: %s\n", status.autostart_enabled ? "enabled" : "disabled");
     puts("coverage: IPv4 TCP only; DNS, UDP, and IPv6 are not proxied");
 }
@@ -75,6 +79,24 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         puts("free_proxy disabled");
+        return 0;
+    }
+    if (strcmp(argv[1], "bypass") == 0) {
+        const char *list = NULL;
+
+        if (argc == 3 && strcmp(argv[2], "--clear") == 0) {
+            list = "";
+        } else if (argc == 4 && strcmp(argv[2], "--set") == 0) {
+            list = argv[3];
+        } else {
+            print_usage(argv[0]);
+            return 2;
+        }
+        if (fp_set_bypass(list) != 0) {
+            fprintf(stderr, "could not update bypass list; configure the proxy first and use valid IPv4/CIDR entries\n");
+            return 1;
+        }
+        printf("bypass list updated: %s\n", *list == '\0' ? "none" : list);
         return 0;
     }
     if (strcmp(argv[1], "uninstall") == 0) {

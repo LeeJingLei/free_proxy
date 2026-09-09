@@ -21,6 +21,21 @@ static void test_proxy_parser(void) {
     assert(fp_parse_proxy("192.168.3.2:65536", &config) != 0);
 }
 
+static void test_bypass_parser(void) {
+    struct fp_config config;
+
+    memset(&config, 0, sizeof(config));
+    assert(fp_parse_bypass_list("192.168.1.25, 10.2.3.4/8", &config) == 0);
+    assert(config.bypass_count == 2);
+    assert(strcmp(config.bypass[0].text, "192.168.1.25") == 0);
+    assert(strcmp(config.bypass[1].text, "10.0.0.0/8") == 0);
+    assert(fp_parse_proxy("192.168.3.2:10808", &config) == 0);
+    assert(config.bypass_count == 2);
+    assert(fp_parse_bypass_list("192.168.1.0/33", &config) != 0);
+    assert(fp_parse_bypass_list("not-an-ip", &config) != 0);
+    assert(fp_parse_bypass_list("", &config) == 0 && config.bypass_count == 0);
+}
+
 static void test_socks5_maximum_domain_reply(void) {
     int sockets[2];
     unsigned char reply[260] = {0x00, 0x03, 0xff};
@@ -157,6 +172,7 @@ static void test_web_probe_waits_for_real_http_response(void) {
 
 int main(void) {
     test_proxy_parser();
+    test_bypass_parser();
     test_socks5_maximum_domain_reply();
     test_socks5_rejects_unknown_address_type();
     test_web_probe_waits_for_real_http_response();

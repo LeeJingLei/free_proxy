@@ -74,6 +74,7 @@ Run `sudo free_proxy` at any time to open the controller.
 | --- | --- |
 | `s` | Enable the previously saved proxy address |
 | `e` | Change the SOCKS5 `IPv4:PORT` and enable it |
+| `b` | Set direct IPv4 or CIDR destinations; separate entries with commas, or leave empty to clear |
 | `d` | Disable the active proxy |
 | `a` | Enable or disable start at boot |
 | `m` | Open the traffic monitor (live rates, totals, active connections) |
@@ -98,11 +99,20 @@ The interactive controller is recommended for normal use. The following commands
 
 ```sh
 sudo free_proxy enable --proxy 192.168.3.2:10808
+sudo free_proxy bypass --set 192.168.1.20,10.0.0.0/8
 sudo free_proxy status
 sudo free_proxy disable
 ```
 
 `enable` saves the address in `/etc/free_proxy/config`, starts the local forwarder, and installs a dedicated iptables NAT chain. `disable` removes only rules created by `free_proxy`.
+
+To keep an internal GitLab or another LAN service off the proxy, press `b` and enter its IPv4 address. Use a CIDR subnet when its address may change: `192.168.1.20` bypasses one address, while `192.168.1.0/24` bypasses that subnet. Up to 32 entries are persisted and applied immediately. To clear them from the CLI:
+
+```sh
+sudo free_proxy bypass --clear
+```
+
+Enter resolved addresses rather than hostnames. Local DNS resolution happens first, then iptables selects direct traffic from the resulting destination IPv4 address. Add every possible address or the containing subnet when a hostname has multiple results.
 
 ## Upgrade and uninstall
 
@@ -165,6 +175,7 @@ Check the host proxy dashboard or connection log to confirm that the request rea
 
 - Only locally initiated IPv4 TCP traffic is proxied.
 - DNS, UDP (including QUIC), IPv6, and ICMP are not proxied.
+- User-configured direct IPv4/CIDR destinations are matched before redirection and do not use SOCKS5.
 - Inbound connections, including SSH sessions into the VM, are not redirected.
 - SOCKS5 username/password authentication and proxy hostnames are not supported.
 - The forwarder limits active client handlers to 128. SOCKS5 connection attempts time out after 10 seconds, handshake I/O after 30 seconds, and idle proxied connections after 5 minutes.

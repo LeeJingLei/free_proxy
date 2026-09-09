@@ -73,6 +73,7 @@ iptables  已启用
 | --- | --- |
 | `s` | 直接启用已经保存的代理地址 |
 | `e` | 修改 SOCKS5 的 `IPv4:端口` 并启用 |
+| `b` | 设置不走代理的 IPv4 地址或 CIDR 网段；多个条目用逗号分隔，留空清除 |
 | `d` | 停用当前代理 |
 | `a` | 启用或停用开机自启 |
 | `m` | 打开流量与连接监控（实时速率、累计流量、活跃连接） |
@@ -97,11 +98,20 @@ iptables  已启用
 
 ```sh
 sudo free_proxy enable --proxy 192.168.3.2:10808
+sudo free_proxy bypass --set 192.168.1.20,10.0.0.0/8
 sudo free_proxy status
 sudo free_proxy disable
 ```
 
 `enable` 会将地址保存至 `/etc/free_proxy/config`，启动本地转发服务并创建专用 iptables NAT 链。`disable` 只会删除 `free_proxy` 创建的规则。
+
+如果内网 GitLab 等服务不应经过代理，可按 `b` 设置其 IPv4 地址；如果服务地址可能变化，建议填写整个内网 CIDR 网段。例如 `192.168.1.20` 只直连一个地址，`192.168.1.0/24` 会直连该网段。最多可设置 32 项，修改后会立即应用并持久保存。清空列表也可以执行：
+
+```sh
+sudo free_proxy bypass --clear
+```
+
+直连列表目前只接受 IP/CIDR，不能直接填写域名。系统先通过本地 DNS 解析域名，iptables 再根据解析得到的目标 IPv4 判断是否直连；若域名同时解析到多个地址，应把这些地址或它们所属的网段都加入列表。可用 `getent ahostsv4 gitlab.example.com` 查询地址。
 
 ## 升级与卸载
 
@@ -164,6 +174,7 @@ curl -4 https://api.ipify.org
 
 - 仅代理本机发起的 IPv4 TCP 流量。
 - DNS、UDP（包括 QUIC）、IPv6 和 ICMP 不走代理。
+- 用户设置的直连 IPv4/CIDR 会在重定向规则之前匹配，因此不经过 SOCKS5。
 - 进入虚拟机的入站连接（包括 SSH 登录）不会被重定向。
 - 不支持 SOCKS5 用户名/密码认证，也不支持将代理服务器写为域名。
 - 转发服务最多同时处理 128 个客户端连接；SOCKS5 连接尝试在 10 秒后超时、握手 I/O 在 30 秒后超时，空闲代理连接在 5 分钟后超时。

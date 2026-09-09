@@ -42,6 +42,88 @@ int fp_parse_proxy(const char *value, struct fp_config *config) {
     return 0;
 }
 
+static int append_bypass(const char *value, size_t length, struct fp_config *config) {
+    char token[INET_ADDRSTRLEN + 4];
+    char address[INET_ADDRSTRLEN];
+    char *slash;
+    char *end = NULL;
+    long prefix = 32;
+    struct in_addr parsed;
+    uint32_t host_address;
+    uint32_t mask;
+    size_t index;
+
+    while (length > 0 && (*value == ' ' || *value == '\t')) {
+        ++value;
+        --length;
+    }
+    while (length > 0 && (value[length - 1] == ' ' || value[length - 1] == '\t')) {
+        --length;
+    }
+    if (length == 0 || length >= sizeof(token) || config->bypass_count >= FP_MAX_BYPASS) {
+        return -1;
+    }
+    memcpy(token, value, length);
+    token[length] = '\0';
+    slash = strchr(token, '/');
+    if (slash != NULL) {
+        *slash++ = '\0';
+        errno = 0;
+        prefix = strtol(slash, &end, 10);
+        if (errno != 0 || *slash == '\0' || *end != '\0' || prefix < 0 || prefix > 32) {
+            return -1;
+        }
+    }
+    if (inet_pton(AF_INET, token, &parsed) != 1) {
+        return -1;
+    }
+    host_address = ntohl(parsed.s_addr);
+    mask = prefix == 0 ? 0 : UINT32_MAX << (32 - (unsigned int)prefix);
+    parsed.s_addr = htonl(host_address & mask);
+    for (index = 0; index < config->bypass_count; ++index) {
+        if (config->bypass[index].network.s_addr == parsed.s_addr &&
+            config->bypass[index].prefix == (unsigned char)prefix) {
+            return 0;
+        }
+    }
+    config->bypass[config->bypass_count].network = parsed;
+    config->bypass[config->bypass_count].prefix = (unsigned char)prefix;
+    if (inet_ntop(AF_INET, &parsed, address, sizeof(address)) == NULL ||
+        (prefix == 32
+             ? snprintf(config->bypass[config->bypass_count].text,
+                        sizeof(config->bypass[config->bypass_count].text), "%s", address)
+             : snprintf(config->bypass[config->bypass_count].text,
+                        sizeof(config->bypass[config->bypass_count].text), "%s/%ld", address,
+                        prefix)) < 0) {
+        return -1;
+    }
+    ++config->bypass_count;
+    return 0;
+}
+
+int fp_parse_bypass_list(const char *value, struct fp_config *config) {
+    const char *start = value;
+    const char *cursor = value;
+
+    config->bypass_count = 0;
+    if (value == NULL || *value == '\0') {
+        return 0;
+    }
+    for (;;) {
+        if (*cursor == ',' || *cursor == '\0') {
+            if (append_bypass(start, (size_t)(cursor - start), config) != 0) {
+                config->bypass_count = 0;
+                return -1;
+            }
+            if (*cursor == '\0') {
+                return 0;
+            }
+            start = cursor + 1;
+        }
+        ++cursor;
+    }
+}
+
 bool fp_config_exists(void) {
     return access(FP_CONFIG_PATH, R_OK) == 0;
 }
@@ -103,8 +185,15 @@ int fp_config_save(const struct fp_config *config) {
     if (file_descriptor < 0) {
         return -1;
     }
-    if (dprintf(file_descriptor, "proxy=%s:%u\n", address, config->proxy_port) < 0 ||
-        fsync(file_descriptor) != 0) {
+    if (dprintf(file_descriptor, "proxy=%s:%u\n", address, config->proxy_port) < 0) {
+        write_result = -1;
+    }
+    for (size_t index = 0; index < config->bypass_count; ++index) {
+        if (dprintf(file_descriptor, "bypass=%s\n", config->bypass[index].text) < 0) {
+            write_result = -1;
+        }
+    }
+    if (fsync(file_descriptor) != 0) {
         write_result = -1;
     }
     if (close(file_descriptor) != 0) {
@@ -125,6 +214,7 @@ int fp_config_load(struct fp_config *config) {
     FILE *file;
     char line[128];
     int result = -1;
+    bool invalid = false;
 
     file = fopen(FP_CONFIG_PATH, "r");
     if (file == NULL) {
@@ -135,8 +225,14 @@ int fp_config_load(struct fp_config *config) {
         line[strcspn(line, "\r\n")] = '\0';
         if (strncmp(line, "proxy=", 6) == 0) {
             result = fp_parse_proxy(line + 6, config);
+            if (result != 0) {
+                invalid = true;
+            }
+        } else if (strncmp(line, "bypass=", 7) == 0 &&
+                   append_bypass(line + 7, strlen(line + 7), config) != 0) {
+            invalid = true;
         }
     }
     fclose(file);
-    return result;
+    return result == 0 && !invalid ? 0 : -1;
 }

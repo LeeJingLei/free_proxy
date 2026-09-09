@@ -32,10 +32,20 @@
 #define FP_IO_TIMEOUT_MS 30000
 #define FP_IDLE_TIMEOUT_MS 300000
 #define FP_MAX_CLIENTS 128
+#define FP_MAX_BYPASS 32
+#define FP_BYPASS_TEXT_SIZE (FP_MAX_BYPASS * 20)
+
+struct fp_bypass {
+    struct in_addr network;
+    unsigned char prefix;
+    char text[INET_ADDRSTRLEN + 4];
+};
 
 struct fp_config {
     struct in_addr proxy_addr;
     unsigned short proxy_port;
+    struct fp_bypass bypass[FP_MAX_BYPASS];
+    size_t bypass_count;
 };
 
 enum fp_ui_language {
@@ -51,6 +61,7 @@ struct fp_status {
     bool autostart_enabled;
     pid_t daemon_pid;
     char proxy[INET_ADDRSTRLEN + 7];
+    char bypass[FP_BYPASS_TEXT_SIZE];
 };
 
 enum fp_test_mode {
@@ -178,6 +189,7 @@ struct fp_diagnostic_event {
 typedef void (*fp_diagnostic_callback)(const struct fp_diagnostic_event *event, void *context);
 
 int fp_parse_proxy(const char *value, struct fp_config *config);
+int fp_parse_bypass_list(const char *value, struct fp_config *config);
 int fp_config_load(struct fp_config *config);
 int fp_config_save(const struct fp_config *config);
 bool fp_config_exists(void);
@@ -248,6 +260,7 @@ int fp_autostart_remove(void);
 
 int fp_enable_proxy(const char *proxy);
 int fp_enable_saved_proxy(void);
+int fp_set_bypass(const char *bypass_list);
 int fp_disable_proxy(void);
 int fp_uninstall(void);
 void fp_collect_status(struct fp_status *status);

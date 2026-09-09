@@ -14,7 +14,7 @@
 #include <unistd.h>
 #include <wchar.h>
 
-#define MIN_ROWS 24
+#define MIN_ROWS 26
 #define MIN_COLS 66
 #define LABEL_WIDTH 18
 
@@ -48,6 +48,7 @@ struct ui_text {
     const char *terminal_small;
     const char *resize;
     const char *proxy;
+    const char *bypass;
     const char *forwarder;
     const char *iptables;
     const char *autostart;
@@ -60,6 +61,7 @@ struct ui_text {
     const char *commands;
     const char *start;
     const char *enable;
+    const char *set_bypass;
     const char *disable;
     const char *startup;
     const char *monitor;
@@ -71,9 +73,11 @@ struct ui_text {
     const char *quit;
     const char *coverage;
     const char *prompt;
+    const char *bypass_prompt;
     const char *initial_message;
     const char *input_cancelled;
     const char *enable_failed;
+    const char *bypass_failed;
     const char *disable_failed;
     const char *startup_failed;
     const char *language_failed;
@@ -85,6 +89,7 @@ static const struct ui_text UI_TEXT[] = {
          "终端尺寸不足：至少需要 %d 列、%d 行。",
          "请调整终端尺寸，或按 q 退出。",
          "SOCKS5 代理",
+         "直连 IP/网段",
          "转发服务",
          "iptables",
          "开机自启",
@@ -97,6 +102,7 @@ static const struct ui_text UI_TEXT[] = {
          "操作",
          "s  启用已保存的代理配置",
          "e  修改 IPv4:端口 并启用代理",
+         "b  设置直连 IPv4/CIDR（多个用逗号分隔）",
          "d  停用代理",
          "a  切换开机自启",
          "m  流量与连接监控",
@@ -108,9 +114,11 @@ static const struct ui_text UI_TEXT[] = {
          "q  退出",
          "范围：仅 IPv4 TCP；DNS、UDP 和 IPv6 不经过代理。",
          "SOCKS5 服务器（IPv4:端口）：",
+         "直连 IP/网段（留空清除，多个用逗号分隔）：",
          "按 s 启用已保存配置，或按 e 修改代理地址。",
          "已取消输入。",
          "无法启用代理，请检查地址和系统配置。",
+         "无法更新直连列表，请检查 IPv4/CIDR 格式。",
          "无法完全停用代理。",
          "无法更改开机自启；请先执行 sudo make install。",
          "无法保存语言设置。"},
@@ -119,6 +127,7 @@ static const struct ui_text UI_TEXT[] = {
          "Terminal too small. Need at least %d columns and %d rows.",
          "Resize the terminal or press q to exit.",
          "SOCKS5 proxy",
+         "Direct IP/CIDR",
          "Forwarder",
          "iptables",
          "Boot startup",
@@ -131,6 +140,7 @@ static const struct ui_text UI_TEXT[] = {
          "Commands",
          "s  Enable saved proxy configuration",
          "e  Change IPv4:PORT and enable proxy",
+         "b  Set direct IPv4/CIDR entries (comma-separated)",
          "d  Disable proxy",
          "a  Toggle boot startup",
          "m  Traffic and connection monitor",
@@ -142,9 +152,11 @@ static const struct ui_text UI_TEXT[] = {
          "q  Quit",
          "Coverage: IPv4 TCP only. DNS, UDP, and IPv6 are not proxied.",
          "SOCKS5 server (IPv4:PORT): ",
+         "Direct IP/CIDR (empty clears; comma-separated): ",
          "Press s to enable saved settings or e to change the proxy.",
          "Proxy input cancelled.",
          "Unable to enable proxy. Check the address and system setup.",
+         "Unable to update direct list. Check the IPv4/CIDR syntax.",
          "Unable to fully disable proxy.",
          "Unable to change boot startup; run sudo make install first.",
          "Unable to save language setting."},
@@ -230,7 +242,7 @@ static void draw_line(int row, const char *label, const char *value, int active)
     } else {
         attron(COLOR_PAIR(2));
     }
-    mvprintw(row, column, "%s", value);
+    mvprintw(row, column, "%.*s", COLS - column - 2, value);
     if (active) {
         attroff(COLOR_PAIR(1) | A_BOLD);
     } else {
@@ -257,34 +269,37 @@ static void draw_screen(const struct fp_status *status, const struct ui_text *te
     mvhline(2, 2, '-', COLS - 4);
 
     draw_line(4, text->proxy, proxy, status->config_valid);
+    draw_line(5, text->bypass,
+              status->config_valid ? status->bypass : "-", status->config_valid);
     if (status->daemon_running) {
         (void)snprintf(daemon, sizeof(daemon), "%s (PID %ld)", text->running,
                        (long)status->daemon_pid);
     } else {
         (void)snprintf(daemon, sizeof(daemon), "%s", text->stopped);
     }
-    draw_line(5, text->forwarder, daemon, status->daemon_running);
-    draw_line(6, text->iptables, status->firewall_enabled ? text->enabled : text->disabled,
+    draw_line(6, text->forwarder, daemon, status->daemon_running);
+    draw_line(7, text->iptables, status->firewall_enabled ? text->enabled : text->disabled,
               status->firewall_enabled);
-    draw_line(7, text->autostart, status->autostart_enabled ? text->enabled : text->disabled,
+    draw_line(8, text->autostart, status->autostart_enabled ? text->enabled : text->disabled,
               status->autostart_enabled);
 
-    mvhline(8, 2, '-', COLS - 4);
+    mvhline(9, 2, '-', COLS - 4);
     attron(A_BOLD);
-    mvprintw(9, 4, "%s", text->commands);
+    mvprintw(10, 4, "%s", text->commands);
     attroff(A_BOLD);
-    mvprintw(10, 4, "%s", text->start);
-    mvprintw(11, 4, "%s", text->enable);
-    mvprintw(12, 4, "%s", text->disable);
-    mvprintw(13, 4, "%s", text->startup);
-    mvprintw(14, 4, "%s", text->monitor);
-    mvprintw(15, 4, "%s", text->test);
-    mvprintw(16, 4, "%s", text->diagnostic);
-    mvprintw(17, 4, "%s", text->uninstall);
-    mvprintw(18, 4, "%s", text->language);
-    mvprintw(19, 4, "%s", text->refresh);
-    mvprintw(20, 4, "%s", text->quit);
-    mvprintw(21, 4, "%s", text->coverage);
+    mvprintw(11, 4, "%s", text->start);
+    mvprintw(12, 4, "%s", text->enable);
+    mvprintw(13, 4, "%s", text->set_bypass);
+    mvprintw(14, 4, "%s", text->disable);
+    mvprintw(15, 4, "%s", text->startup);
+    mvprintw(16, 4, "%s", text->monitor);
+    mvprintw(17, 4, "%s", text->test);
+    mvprintw(18, 4, "%s", text->diagnostic);
+    mvprintw(19, 4, "%s", text->uninstall);
+    mvprintw(20, 4, "%s", text->language);
+    mvprintw(21, 4, "%s", text->refresh);
+    mvprintw(22, 4, "%s", text->quit);
+    mvprintw(23, 4, "%s", text->coverage);
 
     if (message[0] != '\0') {
         attron(A_BOLD);
@@ -1632,6 +1647,64 @@ static int prompt_proxy(char *proxy, size_t proxy_size, const struct ui_text *te
     return 0;
 }
 
+static int prompt_bypass(char *bypass, size_t bypass_size, const struct ui_text *text) {
+    int input_row = LINES - 4;
+    int input_column;
+    size_t length = 0;
+
+    move(input_row, 2);
+    clrtoeol();
+    attron(A_BOLD);
+    mvprintw(input_row, 4, "%s", text->bypass_prompt);
+    attroff(A_BOLD);
+    getyx(stdscr, input_row, input_column);
+    bypass[0] = '\0';
+    curs_set(1);
+    keypad(stdscr, FALSE);
+    timeout(-1);
+    for (;;) {
+        int key = read_proxy_key();
+        int visible_width;
+        size_t visible_start;
+
+        if (key == 27 || key == 'q' || key == 'Q') {
+            keypad(stdscr, TRUE);
+            curs_set(0);
+            timeout(1000);
+            return -1;
+        }
+        if (key == '\n' || key == '\r' || key == KEY_ENTER) {
+            break;
+        }
+        key = keypad_digit(key);
+        if (key == KEY_BACKSPACE || key == 127 || key == '\b') {
+            if (length > 0) {
+                bypass[--length] = '\0';
+            }
+        } else if (key == '.' || key == '/' || key == ',' || key == ' ' ||
+                   (key >= '0' && key <= '9')) {
+            if (length + 1 < bypass_size) {
+                bypass[length++] = (char)key;
+                bypass[length] = '\0';
+            }
+        }
+        visible_width = COLS - input_column - 2;
+        if (visible_width < 1) {
+            visible_width = 1;
+        }
+        visible_start = length > (size_t)visible_width ? length - (size_t)visible_width : 0;
+        move(input_row, input_column);
+        clrtoeol();
+        mvprintw(input_row, input_column, "%.*s", visible_width, bypass + visible_start);
+        move(input_row, input_column + (int)(length - visible_start));
+        refresh();
+    }
+    keypad(stdscr, TRUE);
+    curs_set(0);
+    timeout(1000);
+    return 0;
+}
+
 static int confirm_uninstall(enum fp_ui_language language) {
     char answer[8] = "";
     int row = LINES - 4;
@@ -1704,6 +1777,18 @@ int fp_tui_run(void) {
                                proxy);
             } else {
                 (void)snprintf(message, sizeof(message), "%s", text->enable_failed);
+            }
+        } else if (key == 'b' || key == 'B') {
+            char bypass[FP_BYPASS_TEXT_SIZE] = "";
+
+            if (prompt_bypass(bypass, sizeof(bypass), text) != 0) {
+                (void)snprintf(message, sizeof(message), "%s", text->input_cancelled);
+            } else if (fp_set_bypass(bypass) == 0) {
+                (void)snprintf(message, sizeof(message),
+                               language == FP_UI_LANGUAGE_ZH ? "直连列表已更新。" :
+                                                               "Direct list updated.");
+            } else {
+                (void)snprintf(message, sizeof(message), "%s", text->bypass_failed);
             }
         } else if (key == 'd' || key == 'D') {
             if (fp_disable_proxy() == 0) {

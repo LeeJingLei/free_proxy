@@ -64,6 +64,14 @@ static int output_jump_exists(void) {
     return run_iptables(arguments) == 0;
 }
 
+static int bypass_rule(const char *operation, const char *destination) {
+    char *const arguments[] = {
+        "iptables", "-w", "-t", "nat", (char *)operation, FP_CHAIN,
+        "-d", (char *)destination, "-j", "RETURN", NULL
+    };
+    return run_iptables(arguments);
+}
+
 int fp_firewall_is_enabled(const struct fp_config *config) {
     char proxy_address[INET_ADDRSTRLEN];
     char port[6];
@@ -82,8 +90,16 @@ int fp_firewall_is_enabled(const struct fp_config *config) {
         snprintf(port, sizeof(port), "%u", FP_LISTEN_PORT) < 0) {
         return 0;
     }
-    return chain_exists() && output_jump_exists() && run_iptables(proxy_rule) == 0 &&
-           run_iptables(loopback_rule) == 0 && run_iptables(redirect_rule) == 0;
+    if (!chain_exists() || !output_jump_exists() || run_iptables(proxy_rule) != 0 ||
+        run_iptables(loopback_rule) != 0 || run_iptables(redirect_rule) != 0) {
+        return 0;
+    }
+    for (size_t index = 0; index < config->bypass_count; ++index) {
+        if (bypass_rule("-C", config->bypass[index].text) != 0) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 int fp_firewall_enable(const struct fp_config *config) {
@@ -119,6 +135,12 @@ int fp_firewall_enable(const struct fp_config *config) {
         run_iptables(exclude_loopback) != 0) {
         (void)fp_firewall_disable();
         return -1;
+    }
+    for (size_t index = 0; index < config->bypass_count; ++index) {
+        if (bypass_rule("-A", config->bypass[index].text) != 0) {
+            (void)fp_firewall_disable();
+            return -1;
+        }
     }
     if (run_iptables(redirect) != 0) {
         (void)fp_firewall_disable();
