@@ -1650,7 +1650,11 @@ static int prompt_proxy(char *proxy, size_t proxy_size, const struct ui_text *te
 static int prompt_bypass(char *bypass, size_t bypass_size, const struct ui_text *text) {
     int input_row = LINES - 4;
     int input_column;
-    size_t length = 0;
+    size_t length = strnlen(bypass, bypass_size);
+
+    if (length == bypass_size) {
+        return -1;
+    }
 
     move(input_row, 2);
     clrtoeol();
@@ -1658,10 +1662,21 @@ static int prompt_bypass(char *bypass, size_t bypass_size, const struct ui_text 
     mvprintw(input_row, 4, "%s", text->bypass_prompt);
     attroff(A_BOLD);
     getyx(stdscr, input_row, input_column);
-    bypass[0] = '\0';
     curs_set(1);
     keypad(stdscr, FALSE);
     timeout(-1);
+    {
+        int visible_width = COLS - input_column - 2;
+        size_t visible_start;
+
+        if (visible_width < 1) {
+            visible_width = 1;
+        }
+        visible_start = length > (size_t)visible_width ? length - (size_t)visible_width : 0;
+        mvprintw(input_row, input_column, "%.*s", visible_width, bypass + visible_start);
+        move(input_row, input_column + (int)(length - visible_start));
+        refresh();
+    }
     for (;;) {
         int key = read_proxy_key();
         int visible_width;
@@ -1780,6 +1795,10 @@ int fp_tui_run(void) {
             }
         } else if (key == 'b' || key == 'B') {
             char bypass[FP_BYPASS_TEXT_SIZE] = "";
+
+            if (status.config_valid && strcmp(status.bypass, "none") != 0) {
+                (void)snprintf(bypass, sizeof(bypass), "%s", status.bypass);
+            }
 
             if (prompt_bypass(bypass, sizeof(bypass), text) != 0) {
                 (void)snprintf(message, sizeof(message), "%s", text->input_cancelled);
